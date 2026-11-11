@@ -439,18 +439,14 @@ def verification_queries(config, dsn, action):
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout='10s'")
             cur.execute("SET search_path = pg_catalog, pg_temp")
+            # The server's address and port are never queried, stored or pictured (E2E gate 1,
+            # decision 2): connection details stay with the DBA.
             cur.execute(
-                "SELECT current_database(),inet_server_addr()::text,inet_server_port(),current_setting('server_version'),pg_postmaster_start_time()::text"
+                "SELECT current_database(),current_setting('server_version'),pg_postmaster_start_time()::text"
             )
             identity = dict(
                 zip(
-                    (
-                        "database",
-                        "server_address",
-                        "server_port",
-                        "server_version",
-                        "postmaster_started",
-                    ),
+                    ("database", "server_version", "postmaster_started"),
                     cur.fetchone(),
                 )
             )

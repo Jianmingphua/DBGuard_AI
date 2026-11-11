@@ -510,13 +510,24 @@ def test_mcp_tool_surface_is_unchanged_by_the_image_filter():
 # The demo switches terminal mode on (the default stays rendered)
 # ---------------------------------------------------------------------------
 
-def test_demo_enables_terminal_mode_alongside_screenshots():
+def test_demo_no_longer_switches_sandbox_screenshots_on():
+    # Melvin (10 Nov) overruled the Task 2 demo default: no screenshots inside the sandbox
+    # unless the operator sets them explicitly (environment or .env.demo); the demo itself
+    # neither forces DBGUARD_SCREENSHOTS nor defaults terminal mode any more.
     text = (ROOT / "scripts/demo.py").read_text()
-    on = text.index("self.env['DBGUARD_SCREENSHOTS'] = 'true'")
-    # Re-review: terminal is the demo default, but an explicit environment / .env.demo value wins.
-    mode = text.index("self.env.setdefault('DBGUARD_SCREENSHOT_MODE', 'terminal')")
-    assert 0 < mode - on < 300
+    assert "self.env['DBGUARD_SCREENSHOTS']" not in text
+    assert "self.env.setdefault('DBGUARD_SCREENSHOT_MODE'" not in text
     assert "self.env['DBGUARD_SCREENSHOT_MODE']" not in text
+
+
+def test_suppressed_context_disables_both_capture_modes(monkeypatch):
+    from services.sandbox_poc import terminal_capture as tc
+    monkeypatch.setenv("DBGUARD_SCREENSHOTS", "true")
+    monkeypatch.setenv("DBGUARD_SCREENSHOT_MODE", "terminal")
+    assert tc.screenshot_mode() == "terminal"
+    with tc.suppressed():
+        assert tc.screenshot_mode() == "disabled" and not tc.enabled() and tc.capture_suppressed()
+    assert tc.screenshot_mode() == "terminal" and not tc.capture_suppressed()
 
 
 def test_demo_notice_names_the_variable_and_prints_only_in_terminal_mode():

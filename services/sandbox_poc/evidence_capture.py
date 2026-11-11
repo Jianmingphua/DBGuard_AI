@@ -36,7 +36,8 @@ def verify_runtime(runtime, control, name, value, phase):
         "queries": queries,
     }
     result = {"passed": all(q["passed"] for q in queries), "query_evidence": evidence}
-    if os.environ.get("DBGUARD_SCREENSHOTS") == "true":
+    from .terminal_capture import capture_suppressed
+    if os.environ.get("DBGUARD_SCREENSHOTS") == "true" and not capture_suppressed():
         try:
             result["screenshot"] = capture(evidence)
         except Exception:

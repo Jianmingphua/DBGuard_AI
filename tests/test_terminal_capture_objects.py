@@ -225,11 +225,15 @@ def test_combined_capture_failure_keeps_the_batch_verdict_and_adds_no_files(engi
 
 
 def test_combined_failure_marks_unreached_stages_and_keeps_its_verdict(engine, planted, monkeypatch, tmp_path):  # noqa: F811
+    # Ruling of 10 Nov: a fix that fails in the combined test is left out and the rest are
+    # retried in a new sandbox. The fault is therefore on every combined sandbox (4, 5, 6: one
+    # per fix left out), so no fix is proven and the verdict is still not VERIFIED, no bundle.
+    faults = {4: "apply_error", 5: "apply_error", 6: "apply_error"}
     set_terminal(monkeypatch, on=False)
-    base, _, _, _ = run_batch(engine, planted, monkeypatch, tmp_path, faults={4: "apply_error"})
+    base, _, _, _ = run_batch(engine, planted, monkeypatch, tmp_path, faults=faults)
     set_terminal(monkeypatch)
     monkeypatch.setattr(tc, "capture_stage", Spy())
-    output, data, runtimes, _ = run_batch(engine, planted, monkeypatch, tmp_path, faults={4: "apply_error"})
+    output, data, runtimes, _ = run_batch(engine, planted, monkeypatch, tmp_path, faults=faults)
     assert output["status"] == base["status"] != "VERIFIED" and data is None
     assert output["combined_test"].get("reason") == base["combined_test"].get("reason")
     assert all(r.closed for r in runtimes)

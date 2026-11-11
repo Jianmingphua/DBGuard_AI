@@ -39,6 +39,8 @@ targets taken from the server-side fix unit or evidence-derived proposal.
 from __future__ import annotations
 
 import base64
+import contextlib
+import contextvars
 import functools
 import hashlib
 import json
@@ -108,9 +110,28 @@ class CaptureRefused(Exception):
 # Mode and tools
 # ---------------------------------------------------------------------------
 
+# Melvin (10 Nov): screenshots are no longer taken inside the sandbox for fix-all batches
+# (they move to the DBA package later). The batch job sets this for its own thread only.
+_SUPPRESSED = contextvars.ContextVar("dbguard_sandbox_capture_suppressed", default=False)
+
+
+@contextlib.contextmanager
+def suppressed():
+    """No terminal or rendered sandbox capture in this context, whatever the environment says."""
+    token = _SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESSED.reset(token)
+
+
+def capture_suppressed() -> bool:
+    return _SUPPRESSED.get()
+
+
 def screenshot_mode() -> str:
     """``terminal`` only when DBGUARD_SCREENSHOTS=true and DBGUARD_SCREENSHOT_MODE=terminal."""
-    if os.environ.get("DBGUARD_SCREENSHOTS") != "true":
+    if os.environ.get("DBGUARD_SCREENSHOTS") != "true" or capture_suppressed():
         return "disabled"
     return "terminal" if os.environ.get("DBGUARD_SCREENSHOT_MODE") == "terminal" else "rendered"
 
