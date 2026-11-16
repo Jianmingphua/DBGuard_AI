@@ -62,9 +62,8 @@ MASK = "***MASKED***"
 PSQL_PATHS = (
     "/usr/bin/psql", "/usr/local/bin/psql", "/opt/homebrew/bin/psql",
     "/usr/pgsql-17/bin/psql", "/usr/lib/postgresql/17/bin/psql",
-    "/opt/homebrew/opt/libpq/bin/psql", "/opt/homebrew/opt/postgresql@17/bin/psql",
-    "/usr/local/opt/libpq/bin/psql", "/usr/local/opt/postgresql@17/bin/psql",
-)
+    "/opt/homebrew/opt/libpq/bin/psql", "/usr/local/opt/libpq/bin/psql",
+)  # every entry must pass TYPED_ALLOWED (so no postgresql@17 keg paths: '@' is never typed)
 TOOL_DIR = re.compile(r"/[A-Za-z0-9/._-]+")
 PRIVATE_DIR = re.compile(r"/[A-Za-z0-9/._-]+")
 SETTING_NAME = re.compile(r"[a-z_][a-z0-9_.]*")

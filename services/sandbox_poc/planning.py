@@ -10,6 +10,7 @@ from app.services.spec_engine.operators import evaluate
 from app.services.spec_engine.policy import policy_entry, site_fix
 from app.services.spec_engine.redaction import is_redacted
 from app.services.spec_engine.validate import uses_policy
+from . import client_impact
 from .provenance import setting_rows
 from .shared import ContractError
 
@@ -75,7 +76,8 @@ POLICIES = {
     ),
     "logging_collector": (
         "on",
-        "high",
+        # E2E Gate 1 decision 1 (10 Nov): restart is a downtime label, not a risk floor.
+        "medium",
         "Requires a PostgreSQL restart. In containers, logs move from the console into files; "
         "docker logs goes quiet. Files then need a writable log_directory, rotation and retention.",
         [
@@ -247,7 +249,8 @@ POLICIES = {
     # serves 3.2 and 5.6 with different risks). The risk here is the highest of them.
     "shared_preload_libraries": (
         COMPUTED,
-        "high",
+        # E2E Gate 1 decision 1: the runner refuses unless every added library loads.
+        "medium",
         "Requires a PostgreSQL restart. A library that is not installed stops the server "
         "starting; the bundle runner refuses unless every added library loads on the target.",
         ["Maintenance window", "Install the library's package on the server first"],
@@ -298,7 +301,7 @@ CATALOG_FIX_LINKS = {
         "fix_id": "fix-pgaudit",
         "settings": ("shared_preload_libraries", "pgaudit.log"),
         "library": "pgaudit",
-        "risk": "high",
+        "risk": "medium",  # E2E Gate 1 decision 1 (was high only because of the restart)
         "impact": (
             "Requires a PostgreSQL restart. pgaudit must be installed on the server first: if the "
             "library is missing PostgreSQL does not start (the bundle runner refuses unless it "
@@ -611,13 +614,18 @@ def risk_review(engine, snapshot, control, reviewer=None, template_risk=None):
         ),
         "reference_urls": grounding(name)[1],
     }
+    # E2E Gate 1 decision 3: fixes that can lock out clients carry an explicit warning.
+    impact = client_impact.for_setting(snapshot, name, value)
+    if impact:
+        result["client_impact"] = impact
     return review_floor_and_llm(result, name, reviewer, template_risk)
 
 
 def review_floor_and_llm(result, name, reviewer=None, template_risk=None):
-    """Raise the risk to the approved template's level and the restart floor, then add
-    the optional model advice (which may only raise the risk). Shared by setting and
-    catalog-linked fixes (catalog_fixes.catalog_risk_review)."""
+    """Raise the risk to the approved template's level, label restart downtime separately
+    (E2E Gate 1 decision 1: a restart no longer raises the risk), then add the optional
+    model advice (which may only raise the risk). Shared by setting and catalog-linked
+    fixes (catalog_fixes.catalog_risk_review)."""
     if template_risk:
         result["approved_template_risk"] = template_risk
         ranks = {"low": 0, "medium": 1, "high": 2, "not_assessed": 3}
@@ -626,8 +634,9 @@ def review_floor_and_llm(result, name, reviewer=None, template_risk=None):
             and ranks[template_risk] > ranks[result["operational_risk"]]
         ):
             result["operational_risk"] = template_risk
-    if result["requires"] == "restart":
-        result["operational_risk"] = "high"
+    # E2E Gate 1 decision 1 (10 Nov): a restart is planned downtime, shown as its own
+    # label; it no longer raises the risk, which is only what can break for users.
+    result["downtime"] = "restart" if result["requires"] == "restart" else "none"
     if reviewer:
         try:
             advice = RiskAdvice.model_validate(

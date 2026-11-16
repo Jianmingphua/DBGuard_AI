@@ -396,9 +396,8 @@ def test_three_new_fixes_combined(tmp_path, monkeypatch):
               f"batch={result['run_id']} individual="
               f"{','.join(i['run_id'] for i in result['individual_runs'])} status={result['status']}")
         assert result["status"] == "VERIFIED", result
-        assert all(i["status"] == "VERIFIED" for i in result["individual_runs"])
-        assert sorted(i["fix_id"] for i in result["individual_runs"]) == sorted(
-            "fix-" + n for n in controls)
+        # Combined first (Melvin, 12 Nov): all three passed together, so none ran a test of its own.
+        assert result["individual_runs"] == []
         assert len(combined["steps"]) == 3
         # each fix PASSes in the combined sandbox with the earlier ones still applied
         applied = {}
@@ -744,15 +743,12 @@ def test_three_wave1b_fixes_combined_with_approved_profile(tmp_path, monkeypatch
               f"sandboxes={','.join(individual_attempts)} profile={profile.sha256[:12]} status={result['status']}")
         assert result["status"] == "VERIFIED", result
         assert result["policy_profile"] == profile.pin()
-        assert all(i["status"] == "VERIFIED" for i in result["individual_runs"])
-        for item in result["individual_runs"]:
-            run = history.get(item["run_id"])["result"]
-            attempt = run["attempts"][-1]
-            name = run["fix_unit"]["apply"]["param"]
-            assert run["fix_unit"]["apply"]["value"] == fixed[name]
-            assert attempt["after_assessment"]["findings"][controls[name]]["status"] == "PASS"
-            _assert_exact_rollback(attempt, name, originals[name])
-            assert all(a["cleanup"]["verified"] for a in run["attempts"])
+        # Combined first (Melvin, 12 Nov): no fix ran a test of its own; each fix unit carries the
+        # profile value and the combined test proves it, with every undo exact.
+        assert result["individual_runs"] == []
+        units = {u["apply"]["param"]: u for u in result["fix_units"]}
+        assert {n: u["apply"]["value"] for n, u in units.items()} == fixed
+        assert all(units[n]["prior_state"]["value"] == originals[n]["setting"] for n in broken)
         assert len(combined["steps"]) == 3
         applied = {}
         for step in combined["steps"]:
@@ -770,6 +766,11 @@ def test_three_wave1b_fixes_combined_with_approved_profile(tmp_path, monkeypatch
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             assert z.testzip() is None
             assert all(f"fix-{n}/fix.json" in z.namelist() for n in controls)
+            for name in controls:
+                config = json.loads(z.read(f"fix-{name}/fix.json"))
+                assert config["run_id"] == combined_run and config["combined_run_id"] == result["run_id"]
+                assert config["prior"]["settings"][name]["setting"] == originals[name]["setting"]
+                assert config["applied"]["settings"][name]["setting"] == fixed[name]
         after = engine.collect(r.target)
         assert all(_row(after, n)["setting"] == v for n, v in broken.items())
         assert r.source_evidence()["registry_unchanged"]
@@ -778,9 +779,11 @@ def test_three_wave1b_fixes_combined_with_approved_profile(tmp_path, monkeypatch
     _assert_no_leftovers(r, [combined_run, *individual_attempts])
 
 
-def test_collector_fix_is_ordered_before_a_dependent_log_fix(tmp_path, monkeypatch):
-    """Collector off: 3.1.7 (log_truncate_on_rotation) depends on 3.1.3, so the batch orders
-    fix-logging_collector first although the fix IDs alone would sort the other way."""
+def test_dependent_log_fix_is_verified_after_the_collector_restart(tmp_path, monkeypatch):
+    """Collector off: 3.1.7 (log_truncate_on_rotation) depends on 3.1.3. Melvin's ruling of
+    10 Nov replaced "apply after" with "verify after the restart": the reload fix is written
+    in phase 1, logging_collector in phase 2 with the one restart, and 3.1.7 is checked
+    again once the collector is on."""
     from services.sandbox_poc import history
     from services.sandbox_poc.handoff import build_handoff
 
@@ -813,10 +816,17 @@ def test_collector_fix_is_ordered_before_a_dependent_log_fix(tmp_path, monkeypat
         reviews = {f["fix_id"]: f for f in result["risk_reviews"]}
         assert reviews["fix-log_truncate_on_rotation"]["dependencies"] == ["fix-logging_collector"]
         assert reviews["fix-logging_collector"]["requires"] == "restart"
-        assert result["recommended_order"] == ["fix-logging_collector", "fix-log_truncate_on_rotation"]
+        assert result["recommended_order"] == ["fix-log_truncate_on_rotation", "fix-logging_collector"]
+        assert result["phases"] == {"1": ["fix-log_truncate_on_rotation"], "2": ["fix-logging_collector"]}
         assert [s["fix_id"] for s in combined["steps"]] == result["recommended_order"]
+        assert combined["restarts"] == 1
+        truncate = combined["steps"][0]
+        assert truncate["verification"] == "AFTER_RESTART"
+        assert truncate["verified_after_restart"]["status"] == "PASS"
+        assert truncate["verified_after_restart"]["functional_checks"]["passed"]
+        assert _row(combined["steps"][1]["after"], "logging_collector")["setting"] == "on"
         assert [x["fix_id"] for x in combined["rollback"]] == [
-            "fix-log_truncate_on_rotation", "fix-logging_collector"]
+            "fix-logging_collector", "fix-log_truncate_on_rotation"]
         assert all(x["verified"] for x in combined["rollback"])
         assert combined["cleanup"]["verified"]
         assert r.target.sql("SHOW logging_collector;") == "off"

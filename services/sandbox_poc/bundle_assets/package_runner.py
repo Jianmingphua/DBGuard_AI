@@ -35,6 +35,19 @@ STATE_SCHEMA = "dbguard-package-state-v1"
 STATE_FILE = ".dbguard-applied.json"
 LOCK_FILE = ".dbguard-package.lock"
 RESTART_LINE = "RESTART POSTGRESQL NOW, then run: sh harden.sh verify-all"
+# A later restart round builds on an earlier one (e.g. a second add-on in the preload list),
+# exactly as the sandbox restarted between them.
+RESTART_CONTINUE_LINE = "RESTART POSTGRESQL NOW, then run: sh harden.sh apply-all"
+
+
+def continue_line(args):
+    """The exact apply-all command to run after the restart, with the acknowledgements given."""
+    flags = ["--ack-prerequisites"]
+    if getattr(args, "ack_client_impact", False):
+        flags.append("--ack-client-impact")
+    if getattr(args, "allow_demo", False):
+        flags.append("--allow-demo")
+    return RESTART_CONTINUE_LINE + " " + " ".join(flags)
 RESTART_ROLLBACK_LINE = "RESTART POSTGRESQL NOW, then run: sh harden.sh verify-all --rollback"
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_RESTART = 0, 1, 2, 3
 RUNNER_TIMEOUT_SECONDS = 900
@@ -121,7 +134,10 @@ def load_package(base):
         fix_id, folder = item.get("fix_id"), item.get("folder")
         if (not isinstance(fix_id, str) or not FIX_ID.fullmatch(fix_id) or not isinstance(folder, str)
                 or not FOLDER.fullmatch(folder) or ".." in folder or folder in seen or fix_id in seen
-                or item.get("requires") not in REQUIRES or not isinstance(item.get("client_impact"), bool)):
+                or item.get("requires") not in REQUIRES or not isinstance(item.get("client_impact"), bool)
+                or ("restart_round" in item and (item["requires"] != "restart"
+                                                 or type(item["restart_round"]) is not int
+                                                 or not 1 <= item["restart_round"] <= 10))):
             raise Refused("package.json has a malformed fix entry")
         seen.update((fix_id, folder))
         path = base / folder
@@ -138,7 +154,8 @@ def load_package(base):
                 or (package.get("database") is not None and config.get("database") != package["database"])):
             raise Refused(f"{folder}/fix.json does not belong to this package")
         out.append({"fix_id": fix_id, "folder": folder, "requires": item["requires"],
-                    "client_impact": item["client_impact"], "config": config})
+                    "client_impact": item["client_impact"], "config": config,
+                    "restart_round": item.get("restart_round", 1) if item["requires"] == "restart" else None})
     target_id = package.get("target_id") or out[0]["config"].get("target_id")
     return {"run_id": run_id, "target_id": target_id, "database": package.get("database"), "fixes": out}
 
@@ -205,6 +222,9 @@ class _Lock:
 # Running one fix's own runner
 # ---------------------------------------------------------------------------
 
+ENV_CONNECTION = ("PGHOST", "PGHOSTADDR", "PGPORT", "PGUSER", "PGPASSWORD", "PGSERVICE", "PGDATABASE")
+
+
 def _dsn_secrets(dsn):
     try:
         te = _evidence_module()
@@ -221,6 +241,11 @@ def safe_message(text, dsn):
     line = lines[-1]
     secrets = _dsn_secrets(dsn)
     if secrets is None or not SAFE_MESSAGE.fullmatch(line) or (dsn and dsn in line):
+        return WITHHELD
+    # Review finding 3: libpq can take the host, port and user from the PG* environment
+    # instead of DBGUARD_DSN, and its connection errors name them.
+    if "connection to server" in line.lower() or any(
+            value and value in line for value in (os.environ.get(name) for name in ENV_CONNECTION)):
         return WITHHELD
     try:
         if _evidence_module().contains_secret(line, secrets):
@@ -305,6 +330,18 @@ def _by_id(ctx):
     return {f["fix_id"]: f for f in ctx["package"]["fixes"]}
 
 
+def _touched(fix):
+    """The server settings a fix changes, from its own checked fix.json (objects: none)."""
+    config = fix.get("config") or {}
+    names = set()
+    for key in ("settings", "names"):
+        if isinstance(config.get(key), list):
+            names |= {n for n in config[key] if isinstance(n, str)}
+    if isinstance(config.get("setting"), str):
+        names.add(config["setting"])
+    return names
+
+
 def _names(entries):
     return ", ".join(e["fix_id"] for e in entries) or "none"
 
@@ -322,6 +359,10 @@ def cmd_status(ctx, args):
             live = "applied"
         elif outcome["result"].get("matches_prior") is True:
             live = "not applied"
+        elif index - 1 > len(state["applied"]):
+            # Its tested "before" state is the one the fixes ahead of it leave, so it can only
+            # be checked once they are applied (fix of 16 Nov: no false drift on a fresh target).
+            live = "not applied yet (checked when the fixes before it are applied)"
         else:
             live = "drift (differs from both the tested before and after states)"
         entry = recorded.get(fix["fix_id"])
@@ -331,7 +372,10 @@ def cmd_status(ctx, args):
                     RESTART_PENDING: f"; written by this package at {entry.get('applied_at')}, active after a restart",
                     ROLLBACK_PENDING: "; rollback written, active after a restart"}[entry["status"]]
             if live.startswith("drift") and fix is not fixes[len(recorded) - 1]:
-                note += " (drift is expected here when a later fix of this package changed the same settings)"
+                # Each fix's "after" covers every setting it tracks; later fixes of this package
+                # changed some of them, as tested. The last applied fix's check covers the
+                # current state, so a real change still shows there (16 Nov).
+                live = "applied (later fixes of this package changed settings it also tracks, as tested)"
         print(f"{index}. {fix['fix_id']}: {live}{note}")
     if state.get("failed"):
         print(f"Stopped part-way earlier: {state['failed'].get('fix_id')} (not recorded as applied).")
@@ -349,13 +393,33 @@ def cmd_apply_all(ctx, args):
     if any(e["status"] == ROLLBACK_PENDING for e in state["applied"]):
         raise Refused("A rollback is waiting for a restart. " + RESTART_ROLLBACK_LINE)
     ctx["ack"] = True
+    by_id = _by_id(ctx)
+    written = [e for e in state["applied"] if e["status"] == RESTART_PENDING]
+    if written and len(state["applied"]) < len(fixes):
+        # Continuing after a restart round: the restarted fixes must be active before the
+        # next round builds on them (the sandbox restarted at this same point).
+        for entry in written:
+            outcome = _run(ctx, by_id[entry["fix_id"]], "verify")
+            if not (outcome["ok"] and outcome["result"].get("verified") is True):
+                raise Refused(f"{entry['fix_id']} is written but not active yet. Restart PostgreSQL first, "
+                              "then run apply-all again. (" + (outcome["message"] or "not verified") + ")")
+            entry.update(status=VERIFIED, verified_at=_now())
+            save_state(ctx["base"], state)
+            print(f"{entry['fix_id']}: active after the restart, verified")
     pending = fixes[len(state["applied"]):]
     step = {"command": "apply-all", "result": "IN_PROGRESS", "started_at": _now(), "fixes": []}
     pictured = False
     if not state["applied"]:
         pictured = take_picture(ctx, "before", step)
-    stopped = None
+    stopped, paused = None, False
     for fix in pending:
+        # Each restart fix's guard expects the restart fixes before it to be ACTIVE (its tested
+        # "before" state), so the package pauses for a restart after every restart fix. The
+        # sandbox proved them with fewer restarts; one extra restart on the target is the safe
+        # side (fix of 16 Nov). restart_round in package.json stays informational.
+        if fix["requires"] == "restart" and any(e["status"] == RESTART_PENDING for e in state["applied"]):
+            paused = True
+            break
         print(f"Applying {fix['fix_id']} ...")
         outcome = _run(ctx, fix, "apply")
         result = outcome["result"] or {}
@@ -393,7 +457,13 @@ def cmd_apply_all(ctx, args):
     if waiting:
         print(f"Applied by this package, in order: {_names(state['applied'])}")
         print(f"Written, active after the restart: {_names(waiting)}")
-        print(RESTART_LINE)
+        if paused:
+            print("Not applied yet (they build on these after the restart): "
+                  + ", ".join(f["fix_id"] for f in fixes[len(state["applied"]):]))
+            print("Use the same --screenshots and --evidence-dir options as before, if you gave any.")
+            print(continue_line(args))
+        else:
+            print(RESTART_LINE)
         return EXIT_RESTART
     print(f"All {len(fixes)} fix(es) applied and verified.")
     print("Next: sh harden.sh verify-all")
@@ -409,11 +479,19 @@ def cmd_verify_all(ctx, args):
     if not state["applied"]:
         raise Refused("Nothing is recorded as applied by this package; run apply-all first")
     step = {"command": "verify-all", "result": "IN_PROGRESS", "started_at": _now(), "fixes": []}
-    for entry in state["applied"]:
-        if entry["status"] == VERIFIED:
-            print(f"{entry['fix_id']}: verified in a fresh connection when applied ({entry.get('verified_at')})")
-            step["fixes"].append({"fix_id": entry["fix_id"], "result": "VERIFIED_AT_APPLY"})
+    applied_ids = [e["fix_id"] for e in state["applied"]]
+    for position, entry in enumerate(state["applied"]):
+        # A later fix of this package changed the same settings (e.g. 3.2 pgaudit appends to the
+        # preload list 5.6 passwordcheck wrote). This fix was verified when it took effect, and
+        # the later fix's own check below covers the final value (fix of 16 Nov).
+        later = [f for f in applied_ids[position + 1:] if _touched(by_id[f]) & _touched(by_id[entry["fix_id"]])]
+        if later and entry["status"] == VERIFIED:
+            step["fixes"].append({"fix_id": entry["fix_id"], "result": "VERIFIED_THEN_EXTENDED"})
+            print(f"{entry['fix_id']}: verified when it took effect ({entry.get('verified_at')}); "
+                  f"{', '.join(later)} then changed the same settings and is checked below")
             continue
+        # Review finding 7: every other applied fix is verified again now, in a fresh
+        # connection, so "verified" never relies on a check made before the restart.
         outcome = _run(ctx, by_id[entry["fix_id"]], "verify")
         if not (outcome["ok"] and outcome["result"].get("verified") is True):
             message = outcome["message"] or "The fix runner did not report a verified result."
@@ -425,7 +503,7 @@ def cmd_verify_all(ctx, args):
         entry.update(status=VERIFIED, verified_at=_now())
         save_state(ctx["base"], state)
         step["fixes"].append({"fix_id": entry["fix_id"], "result": "VERIFIED"})
-        print(f"{entry['fix_id']}: verified after the restart")
+        print(f"{entry['fix_id']}: verified now in a fresh connection")
     partial = len(state["applied"]) < len(fixes)
     step.update(result="PARTIAL" if partial else "VERIFIED", finished_at=_now(),
                 applied=len(state["applied"]), package_fixes=len(fixes))

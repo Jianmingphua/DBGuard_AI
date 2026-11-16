@@ -50,13 +50,16 @@ def package_json(run_id, database, fixes, *, system_identifier=None, target_id=N
     for fix in fixes:
         fix_id, folder = fix.get("fix_id"), fix.get("folder", fix.get("fix_id"))
         requires, impact = fix.get("requires") or "none", fix.get("client_impact")
+        rnd = fix.get("restart_round")
         if (not isinstance(fix_id, str) or not package_runner.FIX_ID.fullmatch(fix_id)
                 or not isinstance(folder, str) or not package_runner.FOLDER.fullmatch(folder) or ".." in folder
                 or fix_id in seen or folder in seen or requires not in package_runner.REQUIRES
-                or not isinstance(impact, bool)):
+                or not isinstance(impact, bool)
+                or (rnd is not None and (requires != "restart" or type(rnd) is not int or not 1 <= rnd <= 10))):
             raise ContractError("Package: malformed fix entry")
         seen.update((fix_id, folder))
-        out.append({"fix_id": fix_id, "folder": folder, "requires": requires, "client_impact": impact})
+        out.append({"fix_id": fix_id, "folder": folder, "requires": requires, "client_impact": impact,
+                    **({"restart_round": rnd} if rnd is not None else {})})
     if not out:
         raise ContractError("Package: no fixes")
     return json.dumps({"schema_version": PACKAGE_SCHEMA, "run_id": run_id, "database": database,
@@ -112,6 +115,10 @@ def readme_text(fixes, demo=False) -> str:
         "The package never restarts PostgreSQL. After writing restart fixes, apply-all ends with:",
         "  " + package_runner.RESTART_LINE,
         "Restart PostgreSQL yourself, then run that command.",
+        ("With more than one restart fix, apply-all pauses for a restart after each one (each fix's safety "
+         "check expects the ones before it to be active) and ends with:" if len(restart) > 1 else ""),
+        ("  " + package_runner.RESTART_CONTINUE_LINE + " --ack-prerequisites ... (the same options as before)"
+         if len(restart) > 1 else ""),
         "",
         "ROLLBACK",
         "rollback-all uses each fix's own rollback and refuses drift; it is not a disaster recovery tool.",

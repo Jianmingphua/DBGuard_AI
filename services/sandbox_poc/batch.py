@@ -1,4 +1,5 @@
-"""Test each fix, then prove their ordered combination in one disposable sandbox."""
+"""Prove an ordered set of fixes together in one disposable sandbox; test a fix on its own only
+when it fails there (Melvin's ruling of 12 Nov 2026: combined first)."""
 
 import copy
 import io
@@ -12,10 +13,14 @@ from app.services.spec_engine.policy import approval_text
 from .planning import SANDBOX_LIMITS, change_keys, fix_phase, order_key, recommend_order
 from .provenance import reconstruct, reconstruction_plan, signature
 from .shared import ContractError, blocking_gaps, digest, is_regression
-from .review_bundle import (OBJECT_REHEARSAL_TEXT, PRELOAD_README, TLS_README, build_review_bundle,
+from .review_bundle import (OBJECT_REHEARSAL_TEXT, PRELOAD_README, TLS_README, build_combined_fix_files,
+                            build_review_bundle,
                             is_fixture, object_fingerprint, stage_screenshots, strip_screenshot_data)
 from .workflow import in_transaction, health_queries, _normalised
 from . import catalog_skeleton
+from .runtime import SandboxStartError
+from . import package_assets
+from . import client_impact
 from . import history
 from . import terminal_capture
 
@@ -296,10 +301,12 @@ def _profile(engine, snapshot, request, scopes, proposals):
 
 def _conflict_keys(profile, proposal) -> dict:
     """change key -> plain description, for the conflict rule."""
-    keys = {key: (f"setting {key[1]}" if key[0] == "setting" else "object change") for key in change_keys(profile)}
     if proposal is not None:
-        keys.update({("attribute",) + pair: f"{pair[1]} of {pair[0]}" for pair in _attributes(proposal)})
-    return keys
+        # Per (object, attribute), as object_conflicts: the same change offered under two
+        # controls (NOSUPERUSER for 4.3 and 4.9) is one attribute.
+        return {("attribute",) + pair: "object attribute (" + pair[1].split(":", 1)[-1] + " of "
+                + pair[0].replace("\x1f", ".").replace(":", " ", 1) + ")" for pair in _attributes(proposal)}
+    return {key: f"setting {key[1]}" for key in change_keys(profile)}
 
 
 def plan_batch(requests, service, requested_order=None, fix_all=False) -> dict:
@@ -406,27 +413,62 @@ def _setting_step(engine, runtime, plan, result, previous, skeleton, defer=False
     return step
 
 
-def _phase2(ctx, runtime, record, state, phase2, deferred, applied, applied_catalog, emit):
-    """Write every restart fix, restart the sandbox once (runtime.activate restarts only for
-    the reviewed restart settings), then check each restart fix and the deferred ones."""
+def _changed(result) -> set:
+    """The settings one setting or catalog-linked fix writes."""
+    unit = result["fix_unit"]
+    return {c["param"] for c in unit["changes"]} if "changes" in unit else {unit["apply"]["param"]}
+
+
+def restart_rounds(phase2) -> list:
+    """Restart fixes grouped so that no two fixes in a round write the same setting.
+
+    Normally one round: every restart fix is written, then the sandbox restarts ONCE
+    (Melvin, 10 Nov). A fix that builds on a setting an earlier restart fix of this batch
+    already changed (3.2 and 5.6 both append to shared_preload_libraries) goes to the next
+    round: W2B rulings round 3 derive it from the sandbox's own collection after the
+    earlier fix, which exists only after that fix's restart.
+    """
+    rounds, written = [], []
+    for result in phase2:
+        index = max((i + 1 for i, names in enumerate(written) if names & _changed(result)), default=0)
+        if index == len(rounds):
+            rounds.append([])
+            written.append(set())
+        rounds[index].append(result)
+        written[index] |= _changed(result)
+    return rounds
+
+
+def execution_order(results) -> list:
+    """Phase 1 in the given order, then the restart fixes round by round."""
+    phase2 = [r for r in results if _phase(r) == 2]
+    return [r for r in results if _phase(r) == 1] + [r for group in restart_rounds(phase2) for r in group]
+
+
+def _restart_round(ctx, runtime, record, state, group, before, deferred, applied, applied_catalog, emit):
+    """Write every restart fix of one round, restart the sandbox once (runtime.activate
+    restarts only for the reviewed restart settings), then check each of them, the fixes
+    whose check waited for this restart, and the joint gate. Returns the new state."""
     from . import catalog_fixes as cf
     from .evidence_capture import verify_runtime
     from .workflow import setting_catalog_regressions
     engine, plan, skeleton, pending = ctx["engine"], ctx["plan"], ctx["skeleton"], ctx["pending"]
-    before2 = state["before2"]
-    expected = {n: r["setting"] for n, r in signature(before2, plan["names"])["settings"].items()}
-    derive = before2  # a later chained preload fix is derived from the earlier one's result
+    number = len(state["rounds"]) + 1
+    state["rounds"].append({"before": before, "fixes": group})
+    expected = {n: r["setting"] for n, r in signature(before, plan["names"])["settings"].items()}
+    prior = engine.assess(before)
     written = []
-    for index, result in enumerate(phase2, 1):
+    for index, result in enumerate(group, 1):
         state["current"] = _fid(result)
         emit(kind="combined_write", phase=2, step="apply", fix_id=_fid(result),
-             text=f"{ctx['title']}, phase 2: writing restart fix {index} of {len(phase2)}: "
+             text=f"{ctx['title']}, phase 2: writing restart fix {index} of {len(group)}: "
                   f"{_label(result['risk_review'], _fid(result))}…")
         applied.append(result)  # marked before SQL so a partial apply is also rolled back
         if is_catalog(result):
+            # Re-derived from this sandbox's own collection (W2B rulings round 3).
             spec_id = result["fix_unit"]["spec_id"]
             template, list_template = ctx["catalog_templates"][spec_id]
-            scope = cf.catalog_fix_scope(engine, derive, spec_id, engine.assess(derive))
+            scope = cf.catalog_fix_scope(engine, before, spec_id, prior)
             uses_list = any(c["template"] == cf.LIST_TEMPLATE for c in scope["changes"])
             fix = cf.build_fix(scope, template.version, list_template.version if uses_list else None)
             rendered = cf.rendered_statements(template, scope, list_template if uses_list else None)
@@ -434,7 +476,6 @@ def _phase2(ctx, runtime, record, state, phase2, deferred, applied, applied_cata
             for sql in rendered:
                 runtime.sql(sql)
             expected.update({c["param"]: c["expected_value"] for c in fix["changes"]})
-            derive = cf.hypothetical(derive, fix["changes"], False)
             written.append((result, fix, rendered, scope))
         else:
             runtime.sql(result["rendered_apply_sql"])
@@ -442,14 +483,15 @@ def _phase2(ctx, runtime, record, state, phase2, deferred, applied, applied_cata
             written.append((result, None, None, None))
     state.update(current=None, stage="restart")
     emit(kind="restart", phase=2, step="restart",
-         text=f"{ctx['title']}, phase 2: restarting the sandbox database once for {len(phase2)} restart "
-              f"fix{'es' if len(phase2) != 1 else ''}…")
+         text=(f"{ctx['title']}, phase 2: restarting the sandbox database once for {len(group)} restart "
+               f"fix{'es' if len(group) != 1 else ''}…" if number == 1 else
+               f"{ctx['title']}, phase 2: restarting the sandbox database again for "
+               f"{', '.join(_fid(r) for r in group)}, which builds on a setting an earlier restart fix changed…"))
     runtime.activate(expected)
     record["restarts"] = record.get("restarts", 0) + 1
     state["stage"] = "phase 2"
     after = engine.collect(runtime)
     report = engine.assess(after)
-    prior = engine.assess(before2)
     for index, (result, fix, rendered, scope) in enumerate(written, 1):
         fid = _fid(result)
         state["current"] = fid
@@ -462,22 +504,26 @@ def _phase2(ctx, runtime, record, state, phase2, deferred, applied, applied_cata
             checks = verify_runtime(runtime, unit["spec_id"], unit["apply"]["param"], unit["apply"]["value"], phase)
             own = setting_catalog_regressions(engine, prior, report, unit["apply"]["param"], unit["spec_id"])
             ok = report["findings"][unit["spec_id"]]["status"] == "PASS" and not own and checks["passed"]
-            step = {"fix_id": fid, "before": before2, "after": after, "assessment": report, "functional_checks": checks}
+            step = {"fix_id": fid, "before": before, "after": after, "assessment": report, "functional_checks": checks}
         else:
             own = cf.catalog_regressions(engine, prior, report, [c["param"] for c in fix["changes"]], fix["spec_id"])
             checks = cf.functional_checks(runtime, fix, phase)
             catalog_proof = cf.proof(engine, scope["spec"], after)
             ok = catalog_proof["result"] == "PASS" and not own and checks["passed"]
-            step = {"fix_id": fid, "before": before2, "after": after, "assessment": report, "functional_checks": checks,
+            step = {"fix_id": fid, "before": before, "after": after, "assessment": report, "functional_checks": checks,
                     "catalog_proof": catalog_proof, "fix_unit": fix, "rendered_apply_statements": rendered,
                     "rendered_rollback_sql": cf.rollback_sql(fix), "chained": fix != result["fix_unit"]}
         if not ok:
             raise ContractError("Combined target, regression or functional gate failed after the restart")
-        step.update(phase=2, joint_restart=True)
+        step.update(phase=2, joint_restart=True, restart_round=number)
         record["steps"].append(step)
+    restarted = {_fid(r) for r in applied if _phase(r) == 2}
     for step, result in deferred:
-        # FIX_DEPENDENCIES ruling: verified once logging_collector is on.
+        # FIX_DEPENDENCIES ruling: verified once its prerequisite (logging_collector) is on.
         unit, fid = result["fix_unit"], _fid(result)
+        waiting = set(result["risk_review"].get("dependencies") or []) & ctx["phase2_ids"]
+        if "verified_after_restart" in step or not waiting <= restarted:
+            continue
         state["current"] = fid
         emit(kind="deferred_check", phase=2, step="verify", fix_id=fid,
              text=f"{ctx['title']}, phase 2: checking {_name(result['risk_review'], fid)} again now that "
@@ -488,48 +534,48 @@ def _phase2(ctx, runtime, record, state, phase2, deferred, applied, applied_cata
             raise ContractError("Combined target check failed after the restart that switched logging_collector on")
         step["verified_after_restart"] = {"status": report["findings"][unit["spec_id"]]["status"],
                                           "functional_checks": checks}
-    # The joint gate cannot name one fix; it is attributed to the last (highest-risk) restart fix.
-    state["current"] = _fid(phase2[-1])
+    # The joint gate cannot name one fix; it is attributed to the round's last (highest-risk) fix.
+    state["current"] = _fid(group[-1])
     regressions = [sid for sid, f in prior["findings"].items()
                    if is_regression(f["status"], report["findings"][sid]["status"])
                    or sid in engine.gapped_settings(report["findings"])]
-    catalog_scopes = applied_catalog + [w[3] for w in written if w[3] is not None]
+    applied_catalog += [w[3] for w in written if w[3] is not None]
     objects = [r for r in applied if is_object(r)]
     if (regressions or blocking_gaps(after) or not runtime.health()
-            or not all(cf.proof(engine, s["spec"], after)["result"] == "PASS" for s in catalog_scopes)
+            or not all(cf.proof(engine, s["spec"], after)["result"] == "PASS" for s in applied_catalog)
             or (objects and not all(ctx["fixes"].predicate(r["proposal"], after) for r in objects))
             or (skeleton and catalog_skeleton.fingerprints(after, skeleton)
-                != catalog_skeleton.fingerprints(before2, skeleton))):
+                != catalog_skeleton.fingerprints(before, skeleton))):
         raise ContractError("Combined regression or functional gate failed after the joint restart")
     state["current"] = None
     return after
 
 
-def _joint_rollback(ctx, runtime, record, state, phase2):
-    """Roll back every restart fix, restart once, and verify the exact pre-phase-2 state."""
+def _joint_rollback(ctx, runtime, record, before, group):
+    """Roll back the restart fixes of one round, restart once, and verify the exact state
+    the sandbox had before that round."""
     from . import catalog_fixes as cf
     engine, plan, pending = ctx["engine"], ctx["plan"], ctx["pending"]
-    before2 = state["before2"]
-    for result in reversed(phase2):
+    for result in reversed(group):
         if is_catalog(result):
             if _fid(result) in pending:
                 runtime.sql(pending[_fid(result)]["rollback_sql"])
         else:
             runtime.sql(result["rendered_rollback_sql"])
-    runtime.activate({n: r["setting"] for n, r in signature(before2, plan["names"])["settings"].items()})
+    runtime.activate({n: r["setting"] for n, r in signature(before, plan["names"])["settings"].items()})
     restored = engine.collect(runtime)
-    catalog = [r for r in phase2 if is_catalog(r) and _fid(r) in pending]
+    catalog = [r for r in group if is_catalog(r) and _fid(r) in pending]
     names = list(dict.fromkeys(n for r in catalog for n in
                                r["names"] + [c["param"] for c in pending[_fid(r)]["fix_unit"]["changes"]]))
     specs = [ctx["scopes"][r["fix_unit"]["spec_id"]]["spec"] for r in catalog]
     ok = bool(
-        signature(restored, plan["names"]) == signature(before2, plan["names"])
-        and (not names or cf.catalog_signature(restored, names) == cf.catalog_signature(before2, names))
-        and engine.assess(restored)["findings"] == engine.assess(before2)["findings"]
-        and all(cf.proof(engine, spec, restored) == cf.proof(engine, spec, before2) for spec in specs)
+        signature(restored, plan["names"]) == signature(before, plan["names"])
+        and (not names or cf.catalog_signature(restored, names) == cf.catalog_signature(before, names))
+        and engine.assess(restored)["findings"] == engine.assess(before)["findings"]
+        and all(cf.proof(engine, spec, restored) == cf.proof(engine, spec, before) for spec in specs)
         and not blocking_gaps(restored) and runtime.health()
-        and _objects_unchanged(ctx["skeleton"], restored, before2))
-    for result in reversed(phase2):
+        and _objects_unchanged(ctx["skeleton"], restored, before))
+    for result in reversed(group):
         record["rollback"].append({"fix_id": _fid(result), "verified": ok, "joint_restart": True})
     if not ok:
         raise ContractError("Combined exact rollback failed")
@@ -562,10 +608,11 @@ def _combined_attempt(batch, service, results, emit, attempt):
     applied = []
     objects = [r for r in results if is_object(r)]
     ctx = {"engine": engine, "plan": plan, "skeleton": None, "pending": {}, "scopes": scopes, "title": title,
-           "catalog_templates": batch["catalog_templates"], "fixes": _object_fixes() if objects else None}
+           "catalog_templates": batch["catalog_templates"], "fixes": _object_fixes() if objects else None,
+           "phase2_ids": phase2_ids}
     fixes = ctx["fixes"]
     baseline = None  # the combined sandbox's own first collection (stand-in included)
-    state = {"current": None, "stage": "baseline", "before2": None}
+    state = {"current": None, "stage": "baseline", "rounds": []}  # rounds: [{"before", "fixes"}]
     try:
         runtime.start()
         reconstruct(runtime, plan)
@@ -623,29 +670,50 @@ def _combined_attempt(batch, service, results, emit, attempt):
             step["phase"] = 1
             record["steps"].append(step)
             previous = step["after"]
-        if phase2:
-            state.update(stage="phase 2", before2=previous)
-            _phase2(ctx, runtime, record, state, phase2, deferred, applied,
-                    [scopes[r["fix_unit"]["spec_id"]] for r in applied if is_catalog(r)], emit)
+        applied_catalog = [scopes[r["fix_unit"]["spec_id"]] for r in applied if is_catalog(r)]
+        for group in restart_rounds(phase2):
+            state["stage"] = "phase 2"
+            previous = _restart_round(ctx, runtime, record, state, group, previous, deferred, applied,
+                                      applied_catalog, emit)
         terminal_capture.stage(record, runtime, "after", shots, "combined")
         record["status"] = "VERIFIED"
     except Exception as exc:
         record["reason"] = str(exc)
         record["status"] = "FAILED"
-        if state["stage"] == "restart" and phase2:
-            # The joint restart itself failed: attributed to the last (highest-risk) restart fix.
-            state["current"] = _fid(phase2[-1])
-        if state["stage"] != "baseline" and state["current"]:
-            record.update(failed_fix_id=state["current"], failed_stage=state["stage"])
+        if state["stage"] == "restart" and state["rounds"] and isinstance(exc, SandboxStartError):
+            # PostgreSQL did not come back after the round's joint restart. Which fix of the
+            # round caused it is not known here: execute_batch tests each of them on its own
+            # and leaves out those failing alone (or the whole round if none does). The copy
+            # cannot be undone without a running server; it is discarded and its removal
+            # verified instead (12 Nov fix).
+            round_ids = [_fid(r) for r in state["rounds"][-1]["fixes"]]
+            record.update(failed_fix_id=round_ids[-1], failed_fix_ids=round_ids, failed_stage="restart",
+                          start_failed=True)
+        else:
+            if state["stage"] == "restart" and state["rounds"]:
+                # The joint restart failed after the server came back: the round's last fix.
+                state["current"] = _fid(state["rounds"][-1]["fixes"][-1])
+            if state["stage"] != "baseline" and state["current"]:
+                record.update(failed_fix_id=state["current"], failed_stage=state["stage"])
     finally:
         try:
+            if record.get("start_failed"):
+                # Nothing can be undone on a server that is not running. No undo is claimed:
+                # the copy is thrown away, and only its verified removal counts. The fixes
+                # still in the batch get their undo proven in the retry.
+                record["rollback_skipped"] = ("PostgreSQL did not start after the restart, so the copy was "
+                                              "discarded instead of undone; its removal is verified below.")
+                emit(kind="rollback", phase="rollback", step="rollback",
+                     text=f"{title}: PostgreSQL did not start after the restart; discarding this copy…")
+                applied = []
             if applied:
                 emit(kind="rollback", phase="rollback", step="rollback",
                      text=f"{title}: undoing all fixes and checking the copy is back as before…")
-            applied2 = [r for r in applied if _phase(r) == 2]
             applied1 = [r for r in applied if _phase(r) == 1]
-            if applied2:
-                _joint_rollback(ctx, runtime, record, state, applied2)
+            for group in reversed(state["rounds"]):
+                done = [r for r in group["fixes"] if any(r is a for a in applied)]
+                if done:
+                    _joint_rollback(ctx, runtime, record, group["before"], done)
             steps1 = [s for s in record["steps"] if s.get("phase") == 1]
             for result in reversed(applied1):
                 # Desired baseline is the state immediately before this fix.
@@ -709,15 +777,17 @@ def _combined_attempt(batch, service, results, emit, attempt):
 
 def _attempt_summary(record) -> dict:
     """An earlier combined attempt without its snapshots (the final one is combined_test)."""
-    keep = ("run_id", "attempt", "status", "reason", "failed_fix_id", "failed_stage", "phases", "restarts",
-            "rollback", "rollback_error", "cleanup", "hard_failure")
+    keep = ("run_id", "attempt", "status", "reason", "failed_fix_id", "failed_fix_ids", "failed_stage",
+            "start_failed", "rollback_skipped", "phases", "restarts", "rollback", "rollback_error", "cleanup",
+            "hard_failure")
     summary = {k: copy.deepcopy(record[k]) for k in keep if k in record}
     summary["steps"] = [{"fix_id": s["fix_id"], "phase": s.get("phase")} for s in record["steps"]]
     return summary
 
 
 def run_batch(requests, service, requested_order=None, *, fix_all=False, progress=None, run_id=None):
-    """Test each fix alone, then the passing ones together in one disposable sandbox.
+    """Prepare every fix without a sandbox, then prove them together in one disposable
+    sandbox; a fix is tested on its own only when it fails in the combined test.
 
     Synchronous; the API wraps it in a background job with a progress callback
     (``progress(event: dict)``). Returns (batch evidence, review bundle bytes or None).
@@ -726,7 +796,51 @@ def run_batch(requests, service, requested_order=None, *, fix_all=False, progres
     return execute_batch(batch, service, progress=progress, run_id=run_id)
 
 
+def _single_test(batch, service, request, fid, name, emit, text, individual, everything):
+    """One fix's own sandbox test (service.run: reproduce the FAIL, fix, PASS, exact rollback,
+    cleanup, adaptive retries), run only to find out why it failed in the combined test.
+    Returns (passed, reason, result or None when the run raised before it had a result)."""
+    emit(kind="individual_start", phase="individual", step="individual", fix_id=fid, text=text)
+    try:
+        result = service.run(request)
+    except Exception as exc:
+        reason = _exception_reason(exc)
+        emit(kind="individual_done", status=FAILED, fix_id=fid, phase="individual", step="individual",
+             text=f"{name} also FAILED on its own ({reason}).")
+        return False, reason, None
+    everything.append(result)
+    data = None
+    if result.get("status") == "VERIFIED":
+        try:
+            data = build_review_bundle(request, result, batch["engine"])
+        except ContractError as exc:
+            result = {**result, "review_bundle": {"status": "UNAVAILABLE", "reason": str(exc)}}
+    history.record(request, result, data)
+    individual.append({"run_id": result.get("run_id"), "fix_id": fid, "status": result.get("status")})
+    passed = result.get("status") == "VERIFIED"
+    reason = None if passed else _result_reason(result)
+    emit(kind="individual_done", status=PASSED if passed else FAILED, fix_id=fid, phase="individual",
+         step="individual", text=(f"{name} passed its own test." if passed
+                                  else f"{name} also FAILED on its own ({reason})."))
+    return passed, reason, result
+
+
 def execute_batch(batch, service, *, progress=None, run_id=None):
+    """Melvin's ruling of 12 Nov 2026: combined first, single tests only when needed.
+
+    1. Every eligible fix is prepared WITHOUT a sandbox (service.prepare: the single run's
+       validation, approved hash-pinned templates, fix unit, rendered SQL, risk review). A fix
+       whose preparation fails is FAILED (stage "preparation"); the others continue.
+    2. The combined test runs first. If it passes, the run is finished: no single tests.
+    3. A fix that fails in the combined test (its per-step check names it) gets its own
+       test: FAILED "individual" if that fails too, else FAILED "combined" (works alone,
+       not with the others). It is left out and the rest are tested together again.
+    4. PostgreSQL does not start after a joint restart: each restart fix of that round is
+       tested on its own; only those failing alone are left out. If none fails alone, the
+       whole round is left out (they cannot be told apart).
+    A fix is packaged only if the FINAL combined test is VERIFIED including its exact undo;
+    rollback and cleanup failures (also of a single test) stay hard failures.
+    """
     emit = _Emit(progress)
     engine, first = batch["engine"], batch["first"]
     requests, eligible = batch["requests"], batch["eligible"]
@@ -737,55 +851,35 @@ def execute_batch(batch, service, *, progress=None, run_id=None):
             fixes[key] = {"fix_id": _fix_id_for(batch, r), "status": NOT_ELIGIBLE, "stage": "planning",
                           "reason": batch["not_eligible"][key]}
     count = len(eligible)
-    emit(kind="plan", count=count, phase="individual", step="plan",
-         text=f"Testing {count} fix{'es' if count != 1 else ''} on their own first"
-              + (f"; {len(batch['not_eligible'])} not eligible (conflict)." if batch["not_eligible"] else "."))
-    results, individual, everything = [], [], []
-    hard_individual = None
+    emit(kind="plan", count=count, phase="prepare", step="plan",
+         text=f"Preparing {count} fix{'es' if count != 1 else ''} (no sandbox needed)"
+              + (f"; {len(batch['not_eligible'])} not eligible (conflict)." if batch["not_eligible"] else "…"))
+    results, individual, everything, request_of = [], [], [], {}
     for index, r in enumerate(eligible, 1):
         key = request_fix_id(r)
         profile = batch["profiles"].get(key)
         fallback = _fix_id_for(batch, r)
-        emit(kind="individual_start", phase="individual", step="individual", fix_id=fallback,
-             text=f"Testing fix {index} of {count} on its own: {_label(profile, fallback)}…")
+        emit(kind="prepare_start", phase="prepare", step="prepare", fix_id=fallback,
+             text=f"Preparing fix {index} of {count}: {_label(profile, fallback)}…")
         try:
-            result = service.run(r)
+            item = service.prepare(r)
+            if not _request_matches(r, item):
+                raise ContractError("The prepared fix differs from the selected fix")
         except Exception as exc:
             reason = _exception_reason(exc)
-            fixes[key] = {"fix_id": fallback, "status": FAILED, "stage": "individual", "reason": reason}
-            emit(kind="individual_done", status=FAILED, fix_id=fallback,
-                 text=f"Fix {index} of {count} FAILED its test and was left out: {_name(profile, fallback)} ({reason}).")
+            fixes[key] = {"fix_id": fallback, "status": FAILED, "stage": "preparation", "reason": reason}
+            emit(kind="prepare_done", status=FAILED, fix_id=fallback, phase="prepare", step="prepare",
+                 text=f"Fix {index} of {count} could not be prepared and was left out: {_name(profile, fallback)} ({reason}).")
             continue
-        everything.append(result)
-        data = None
-        if result.get("status") == "VERIFIED":
-            try:
-                data = build_review_bundle(r, result, engine)
-            except ContractError as exc:
-                result = {**result, "review_bundle": {"status": "UNAVAILABLE", "reason": str(exc)}}
-        history.record(r, result, data)
-        fid = (result.get("fix_unit") or {}).get("fix_id") or fallback
-        individual.append({"run_id": result.get("run_id"), "fix_id": fid, "status": result.get("status")})
-        if result.get("status") == "VERIFIED" and data is not None:
-            results.append(result)
-            fixes[key] = {"fix_id": fid, "status": PASSED, "stage": "individual", "reason": None}
-            emit(kind="individual_done", status=PASSED, fix_id=fid,
-                 text=f"Fix {index} of {count} passed its own test: {_name(profile, fid)}.")
-            continue
-        reason = (_result_reason(result) if data is not None or result.get("status") != "VERIFIED"
-                  else "Its review package could not be built: " + result["review_bundle"]["reason"])
-        fixes[key] = {"fix_id": fid, "status": FAILED, "stage": "individual", "reason": reason}
-        emit(kind="individual_done", status=FAILED, fix_id=fid,
-             text=f"Fix {index} of {count} FAILED its test and was left out: {_name(profile, fid)} ({reason}).")
-        if result.get("status") == "CLEANUP_FAILED":
-            # A sandbox that could not be removed stops everything (never partial).
-            hard_individual = result
-            break
+        results.append(item)
+        everything.append(item)
+        request_of[_fid(item)] = r
+        emit(kind="prepare_done", status=PASSED, fix_id=_fid(item), phase="prepare", step="prepare")
     reviews = {_fid(r): r["risk_review"] for r in results}
     ordered = recommend_order(list(reviews.values()), allow_missing_dependencies=True) if results else []
     requested_order = batch["requested_order"]
     if requested_order and results:
-        known = {f["fix_id"] for f in fixes.values()}
+        known = set(reviews) | {f["fix_id"] for f in fixes.values()}
         if set(reviews) - set(requested_order) or set(requested_order) - known:
             raise ContractError("Selected order must contain every fix exactly once")
         chosen = [reviews[fid] for fid in requested_order if fid in reviews]
@@ -801,34 +895,100 @@ def execute_batch(batch, service, *, progress=None, run_id=None):
         ordered = chosen
     indexed = {_fid(r): r for r in results}
     remaining = [indexed[f["fix_id"]] for f in ordered]
-    attempts, record, retries = [], None, 0
-    while remaining and hard_individual is None:
+    if requested_order and execution_order(remaining) != remaining:
+        raise ContractError("Selected order must put a restart fix that builds on another restart fix's "
+                            "setting after every other restart fix")
+    attempts, record, retries, singles, tested, hard_single = [], None, 0, {}, {}, None
+    while remaining:
+        remaining = execution_order(remaining)
         record = _combined_attempt(batch, service, remaining, emit, len(attempts) + 1)
         attempts.append(record)
         failed = record.get("failed_fix_id")
         if record["status"] == "VERIFIED" or record["hard_failure"] or failed is None:
             break
-        key = next(request_fix_id(r) for r in requests if _request_matches(r, indexed[failed]))
-        fixes[key] = {"fix_id": failed, "status": FAILED, "stage": "combined", "reason": record.get("reason")}
-        remaining = [r for r in remaining if _fid(r) != failed]
-        emit(kind="combined_failed", status=FAILED, fix_id=failed, phase="combined", step="excluded",
-             text=f"{failed} FAILED in the combined test and was left out ({record.get('reason')})."
-                  + (" Testing the others together again…" if remaining and retries < MAX_COMBINED_RETRIES else ""))
+        suspects = record.get("failed_fix_ids") or [failed]
+        reason = record.get("reason")
+        if record.get("start_failed"):
+            emit(kind="culprit_search", phase="individual", step="individual",
+                 text=f"PostgreSQL did not start after the restart for {', '.join(suspects)}; testing "
+                      + ("each of these restart fixes on its own to find the cause…" if len(suspects) > 1
+                         else "it on its own to find out why…"))
+        outcomes = {}
+        for number, fid in enumerate(suspects, 1):
+            if fid in tested:
+                # Already tested on its own after an earlier restart failure (and kept): reuse it.
+                outcomes[fid] = tested[fid]
+                continue
+            name = _name(indexed[fid]["risk_review"], fid)
+            text = (f"Testing restart fix {number} of {len(suspects)} on its own: {_label(indexed[fid]['risk_review'], fid)}…"
+                    if record.get("start_failed") else
+                    f"{name} FAILED in the combined test; testing it on its own to find out why…")
+            passed, why, result = _single_test(batch, service, request_of[fid], fid, name, emit, text, individual,
+                                               everything)
+            outcomes[fid] = tested[fid] = (passed, why)
+            if result is not None:
+                singles[fid] = result
+                if result.get("status") == "CLEANUP_FAILED":
+                    # A sandbox that could not be removed stops everything (never partial).
+                    hard_single = result
+                    break
+        if hard_single is not None:
+            break
+        if record.get("start_failed"):
+            culprits = [fid for fid in suspects if not outcomes[fid][0]]
+            dropped = culprits or suspects
+        else:
+            dropped = suspects
+        remaining = [r for r in remaining if _fid(r) not in dropped]
+        for fid in dropped:
+            passed, why = outcomes[fid]
+            key = request_fix_id(request_of[fid])
+            if not passed:
+                fixes[key] = {"fix_id": fid, "status": FAILED, "stage": "individual", "reason": why}
+                text = f"{fid} FAILED on its own too and was left out ({why})."
+            else:
+                if record.get("start_failed") and len(dropped) > 1:
+                    why = (f"{reason}. These restart fixes were restarted together ({', '.join(dropped)}); each "
+                           "passes its own test, and which one stopped PostgreSQL starting cannot be told apart, so "
+                           "all were left out")
+                else:
+                    why = ("It passes its own test, but not together with the other fixes; in the combined test: "
+                           + str(reason))
+                fixes[key] = {"fix_id": fid, "status": FAILED, "stage": "combined", "reason": why}
+                text = (f"{fid} FAILED in the combined test and was left out: it passes on its own but not "
+                        "together with the others.")
+            emit(kind="combined_failed", status=FAILED, fix_id=fid, phase="combined", step="excluded",
+                 text=text + (" Testing the others together again…"
+                              if fid == dropped[-1] and remaining and retries < MAX_COMBINED_RETRIES else ""))
         if retries >= MAX_COMBINED_RETRIES:
             break
         retries += 1
-    proven = remaining if record is not None and record["status"] == "VERIFIED" else []
-    hard = (hard_individual is not None) or bool(record and record["hard_failure"])
-    for result in remaining:
-        key = next(request_fix_id(r) for r in requests if _request_matches(r, result))
-        if proven:
-            fixes[key] = {"fix_id": _fid(result), "status": PASSED, "stage": "combined", "reason": None}
-        else:
-            reason = (("The combined test failed: " + (record.get("reason") or record.get("rollback_error")
-                                                       or "its sandbox could not be removed")) if hard
-                      else f"Not proven together: the combined test stopped after {MAX_COMBINED_RETRIES} retries")
-            fixes[key] = {"fix_id": _fid(result), "status": FAILED, "stage": "combined", "reason": reason}
-    if hard_individual is not None:
+    proven = remaining if record is not None and record["status"] == "VERIFIED" and hard_single is None else []
+    hard = (hard_single is not None) or bool(record and record["hard_failure"])
+    if hard_single is not None:
+        stopped = ("Not tested further: the batch stopped because the sandbox of "
+                   + ((hard_single.get("fix_unit") or {}).get("fix_id") or "another fix") + " could not be removed")
+        culprit = (hard_single.get("fix_unit") or {}).get("fix_id")
+        for r in eligible:
+            key = request_fix_id(r)
+            fid = next((f for f, req in request_of.items() if req is r), None)
+            if fid is not None and fid == culprit:
+                fixes[key] = {"fix_id": fid, "status": FAILED, "stage": "individual",
+                              "reason": _result_reason(hard_single)}
+            elif key not in fixes:
+                fixes[key] = {"fix_id": fid or _fix_id_for(batch, r), "status": FAILED, "stage": "combined",
+                              "reason": stopped}
+    else:
+        for result in remaining:
+            key = request_fix_id(request_of[_fid(result)])
+            if proven:
+                fixes[key] = {"fix_id": _fid(result), "status": PASSED, "stage": "combined", "reason": None}
+            else:
+                reason = (("The combined test failed: " + (record.get("reason") or record.get("rollback_error")
+                                                           or "its sandbox could not be removed")) if hard
+                          else f"Not proven together: the combined test stopped after {MAX_COMBINED_RETRIES} retries")
+                fixes[key] = {"fix_id": _fid(result), "status": FAILED, "stage": "combined", "reason": reason}
+    if hard_single is not None:
         status = "CLEANUP_FAILED"
     elif hard:
         status = record["status"]
@@ -837,11 +997,12 @@ def execute_batch(batch, service, *, progress=None, run_id=None):
             else "PARTIAL"
     else:
         status = "FAILED"
-    final = proven or remaining or [indexed[f["fix_id"]] for f in ordered]
+    final = proven or remaining or execution_order([indexed[f["fix_id"]] for f in ordered])
     final_reviews = [r["risk_review"] for r in final]
     output = {
         "run_id": run_id or str(uuid.uuid4()),
         "status": status,
+        # Only the single tests that actually ran (Melvin, 12 Nov): often none.
         "individual_runs": individual,
         "order_source": "DBA_SELECTED" if requested_order else "RECOMMENDED",
         "recommended_order": [_fid(r) for r in final],
@@ -854,9 +1015,9 @@ def execute_batch(batch, service, *, progress=None, run_id=None):
         output["combined_test"] = record
         output["combined_attempts"] = [_attempt_summary(a) for a in attempts]
     if status in ("FAILED", "CLEANUP_FAILED") and not proven:
-        output["reason"] = (_result_reason(hard_individual) if hard_individual is not None
+        output["reason"] = (_result_reason(hard_single) if hard_single is not None
                             else (record.get("reason") or record.get("rollback_error")) if record is not None
-                            else "No selected fix passed its own sandbox test; combined execution was not started")
+                            else "No selected fix could be prepared; the combined test was not started")
     output.update(
         schema_version="sandbox-batch-v1",
         snapshot_hash=digest(first.snapshot),
@@ -874,7 +1035,7 @@ def execute_batch(batch, service, *, progress=None, run_id=None):
         return output, None
     emit(kind="bundle", phase="bundle", step="bundle", text="Building the package…")
     try:
-        data = _batch_bundle(batch, output, proven, record)
+        data = _batch_bundle(batch, output, proven, record, singles)
     except ContractError as exc:
         output["review_bundle"] = {"status": "UNAVAILABLE", "reason": str(exc)}
         data = None
@@ -900,78 +1061,58 @@ def _compose(before, after, names):
 
 
 def _bundle_states(results, steps):
-    """(before, after) for each fix's runner guard. Phase 2 fixes were written together and
-    checked after one restart; on the target they are applied one at a time, so fix k's
-    guard uses the observed pre-restart state with the settings of the earlier restart
-    fixes (and for ``after`` its own) taken from the observed post-restart state."""
-    states, earlier = [], set()
+    """(before, after) for each fix's runner guard. The restart fixes of one round were
+    written together and checked after one restart; on the target they are applied one at a
+    time, so fix k's guard uses the round's observed state before the restart with the
+    settings of the round's earlier fixes (and for ``after`` its own) taken from the
+    observed state after the restart. No two fixes of a round write the same setting."""
+    states, earlier, current = [], set(), None
     for result, step in zip(results, steps):
         if step.get("phase") != 2:
             states.append((step["before"], step["after"]))
             continue
+        if step.get("restart_round") != current:
+            earlier, current = set(), step.get("restart_round")
         unit = step.get("fix_unit") or result["fix_unit"]
         own = ({c["param"] for c in unit["changes"]} if "changes" in unit else {unit["apply"]["param"]})
         if own & earlier:
-            raise ContractError("Two restart fixes in this batch change " + ", ".join(sorted(own & earlier))
-                                + ": the one-restart combined test cannot give each its own runner guard. "
-                                "Test them in separate batches to export a package.")
+            raise ContractError("Two restart fixes of one round change " + ", ".join(sorted(own & earlier))
+                                + "; no runner guard can be derived")
         states.append((_compose(step["before"], step["after"], earlier),
                        _compose(step["before"], step["after"], earlier | own)))
         earlier |= own
     return states
 
 
-def _batch_bundle(batch, output, results, record):
-    """The DBA bundle for the fixes proven together (layout unchanged)."""
-    from . import catalog_fixes as cf
+def _batch_bundle(batch, output, results, record, singles=None):
+    """The DBA package for the fixes proven together. Each fix's folder is built from its
+    preparation and the final VERIFIED combined test's records (Melvin, 12 Nov), never from
+    a single-fix run; ``singles`` are the single tests that ran, reported where relevant."""
     engine, requests = batch["engine"], batch["requests"]
+    singles = singles or {}
     ordered = output["risk_reviews"]
     scopes = {r["fix_unit"]["spec_id"]: batch["scopes"][r["fix_unit"]["spec_id"]] for r in results if is_catalog(r)}
     objects = [r for r in results if is_object(r)]
-    files = {}
-    for result, step, (before, after) in zip(results, record["steps"], _bundle_states(results, record["steps"])):
+    files, configs, warnings = {}, [], []
+    steps = record["steps"]
+    if [s["fix_id"] for s in steps] != [_fid(r) for r in results]:
+        raise ContractError("Review bundle: the combined steps differ from the fixes proven together")
+    for position, (result, step, (before, after)) in enumerate(
+            zip(results, steps, _bundle_states(results, steps)), 1):
         handoff = next(r for r in requests if _request_matches(r, result))
-        with zipfile.ZipFile(
-            io.BytesIO(build_review_bundle(handoff, result, engine))
-        ) as z:
-            members = {name: z.read(name) for name in z.namelist()}
-        config = json.loads(members["fix.json"])
-        if is_object(result):
-            # The runner's guard expects the preceding fixes to remain applied.
-            config["prior"] = object_fingerprint(result["proposal"], before)
-            config["applied"] = object_fingerprint(result["proposal"], after)
-        elif is_catalog(result):
-            if step.get("chained"):
-                # Re-derived in the combined order: the list keeps the earlier fix's library.
-                chained = step["fix_unit"]
-                config["names"] = list(dict.fromkeys(config["names"] + [c["param"] for c in chained["changes"]]))
-                config["apply_statements"] = [s for c in chained["changes"] for s in render_action(c["apply"])]
-                config["rollback_statements"] = [s + ";" for c in reversed(chained["changes"])
-                                                 for s in render_action(c["rollback"])]
-                config["preload_added"] = list(chained["preload_added"])
-                config["settings"] = [c["param"] for c in chained["changes"]]
-                config["combined_order_fix_unit"] = chained
-                note = ("<h2>Combined order</h2><p class=\"notice\">In this batch the fix was re-derived from "
-                        "the state the preceding fixes leave, so its SQL differs from the isolated test above. "
-                        "harden.sh runs this SQL:</p><pre>" + escape("\n".join(step["rendered_apply_statements"]))
-                        + "</pre><p>Rollback:</p><pre>" + escape(step["rendered_rollback_sql"]) + "</pre></body>")
-                members["report.html"] = members["report.html"].decode().replace("</body>", note, 1).encode()
-            config["prior"] = cf.catalog_signature(before, config["names"])
-            config["applied"] = cf.catalog_signature(after, config["names"])
-        else:
-            # The setting bundle's own scoped names (review_bundle: the setting specs), which
-            # the runner fingerprints; plan["names"] also holds any catalog-fix settings.
-            names = [sp["check"]["setting_name"] for sp in engine.specs
-                     if "check" in sp and sp["check"].get("kind") != "catalog"]
-            config["prior"] = signature(before, names)
-            config["applied"] = signature(after, names)
-        config["combined_run_id"] = output["run_id"]
-        members["fix.json"] = json.dumps(config, indent=2).encode()
-        manifest = json.loads(members["manifest.json"])
-        manifest["files"]["fix.json"] = hashlib.sha256(members["fix.json"]).hexdigest()
-        if is_catalog(result) and step.get("chained"):
-            manifest["files"]["report.html"] = hashlib.sha256(members["report.html"]).hexdigest()
-        members["manifest.json"] = json.dumps(manifest, indent=2).encode()
+        # E2E Gate 1 decision 3: the package runner refuses apply-all without
+        # --ack-client-impact when any fix can lock out clients.
+        impact = client_impact.of_result(result)
+        members = build_combined_fix_files(
+            handoff, result, step, record, engine, prior_snapshot=before, applied_snapshot=after,
+            package_run_id=output["run_id"], position=position, total=len(results),
+            client_impact=bool(impact), single=singles.get(_fid(result)))
+        if impact:
+            warnings.append((_fid(result), (result.get("risk_review") or result.get("proposal") or {}).get("title"),
+                             impact))
+        # The sandbox restarts once per round of restart fixes (a fix building on another's
+        # preload list waits for a second restart); the package must pause the same way.
+        configs.append((_fid(result), json.loads(members["fix.json"]), step.get("restart_round")))
         prefix = _fid(result) + "/"
         files.update({prefix + k: v for k, v in members.items()})
     # Review N9: the combined stage PNGs are bundle members; keep names and hashes, not base64.
@@ -983,21 +1124,24 @@ def _batch_bundle(batch, output, results, record):
              else "")
     left_out = [f for f in output["fixes"] if f["status"] != PASSED]
     if output["status"] == "PARTIAL":
-        head = ("PARTIAL RESULT: only the fixes in this package passed individually and together in one "
-                "disposable sandbox. Left out (not in this package):\n"
+        head = ("PARTIAL RESULT: only the fixes in this package passed together in one disposable sandbox "
+                f"(combined test {record['run_id']}). Left out (not in this package):\n"
                 + "".join(f"- {f['fix_id']}: {f['status']} ({f['stage']}): {f['reason']}\n" for f in left_out))
     else:
-        head = "All selected fixes passed individually and together in one disposable sandbox.\n"
+        head = f"All selected fixes passed together in one disposable sandbox (combined test {record['run_id']}).\n"
     restart_ids = output["phases"]["2"]
     restart_note = (("Restart fixes (" + ", ".join(restart_ids) + ") were written together and checked after one "
-                     "restart of the sandbox. On the target, apply them one at a time in the order below: each "
-                     "runner stops with RESTART_REQUIRED; restart PostgreSQL, run verify, then continue.\n")
+                     "restart of the sandbox. On the target, sh harden.sh apply-all pauses for a PostgreSQL restart "
+                     "after each of them (each one's safety check expects the ones before it to be active) and tells "
+                     "you exactly what to run next (see ONE COMMAND below). By hand "
+                     "instead, apply them one at a time in the order below: each runner stops with RESTART_REQUIRED; "
+                     "restart PostgreSQL, run verify, then continue.\n")
                     if restart_ids else "")
     files["README.txt"] = (
-        scope + head + restart_note + "Apply one complete fix at a time in this order: "
+        scope + head + restart_note + "Use sh harden.sh apply-all (see ONE COMMAND below), or apply one complete fix at a time by hand in this order: "
         + ", ".join(output["recommended_order"])
         + "\n" + approval_text(engine.policy_pin)
-        + "\nVerify each before proceeding. Roll back in REVERSE order.\nThe per-fix guard expects the preceding fixes to remain applied. If a DBA chooses another order, create and test a new batch.\nIndividual report.html files show isolated tests; combined-evidence.json records the combined states.\nTarget changes have NOT been performed.\n"
+        + "\nVerify each before proceeding. Roll back in REVERSE order.\nThe per-fix guard expects the preceding fixes to remain applied. If a DBA chooses another order, create and test a new batch.\nEach fix's report.html shows its own step in the combined test; combined-evidence.json records the whole combined test, and its individual_runs lists any fix that was also tested on its own.\nTarget changes have NOT been performed.\n"
         + "".join(f"\nSANDBOX LIMIT ({f['fix_id']}): {SANDBOX_LIMITS[f['setting']]}\n"
                   for f in ordered if f.get("setting") in SANDBOX_LIMITS)
         + (OBJECT_REHEARSAL_TEXT if objects else "")
@@ -1005,8 +1149,8 @@ def _batch_bundle(batch, output, results, record):
                   for r in results if is_catalog(r) and r["fix_unit"]["preload_added"])
         + (TLS_README if any(scope["tls"] for scope in scopes.values()) else "")
     ).encode()
-    partial_html = ("<p class=\"notice\">PARTIAL RESULT: only the fixes listed below passed individually and "
-                    "together. Left out:</p><ul>"
+    partial_html = ("<p class=\"notice\">PARTIAL RESULT: only the fixes listed below passed together in one "
+                    "disposable sandbox. Left out:</p><ul>"
                     + "".join(f"<li>{escape(f['fix_id'])}: {escape(f['status'])} ({escape(f['stage'])}): "
                               f"{escape(str(f['reason']))}</li>" for f in left_out) + "</ul>"
                     if output["status"] == "PARTIAL" else "")
@@ -1036,12 +1180,47 @@ def _batch_bundle(batch, output, results, record):
         files["README.txt"] += shot_text.encode()
         files["report.html"] = files["report.html"].decode().replace("</body>", shot_html + "</body>", 1).encode()
         files.update(shot_files)
-        files["manifest.json"] = json.dumps({
-            "schema_version": "review-bundle-v1", "run_id": output["run_id"],
-            "demo_fixture_approval": output["demo_fixture_approval"], "requires_dba_review": True,
-            "snapshot_hash": output["snapshot_hash"], "spec_set_hash": engine.spec_set_hash,
-            "files": {name: hashlib.sha256(files[name]).hexdigest()
-                      for name in ("combined-evidence.json", "report.html", *shot_files)}}, indent=2).encode()
+    if warnings:
+        # E2E Gate 1 decision 3: direct, never a footnote: top of the README and report,
+        # and a CLIENT-ACTIONS.txt the runner's --ack-client-impact refers to.
+        actions = ("CLIENT ACTIONS REQUIRED BEFORE AND AFTER APPLYING THIS PACKAGE\n"
+                   "These fixes harden the server but can block clients that are not updated. Hardening\n"
+                   "this server does NOT update them. apply-all refuses to run without --ack-client-impact.\n\n"
+                   + "".join(client_impact.text_block(fid, title, w) + "\n" for fid, title, w in warnings))
+        files["CLIENT-ACTIONS.txt"] = actions.encode()
+        files["README.txt"] = (f"!!! CLIENT ACTION REQUIRED for {len(warnings)} fix(es): read CLIENT-ACTIONS.txt "
+                               "before applying. !!!\n\n").encode() + files["README.txt"]
+        block = ('<section style="border:2px solid #b91c1c;background:#fef2f2;padding:16px;margin:16px 0">'
+                 '<h2 style="color:#b91c1c;margin-top:0">\u26a0 Client action required</h2>'
+                 "<p><strong>These fixes harden the server but will block clients that are not updated. "
+                 "Hardening this server does not update them.</strong> Read CLIENT-ACTIONS.txt.</p>"
+                 + "".join(f"<h3>{escape(fid)}: {escape(w['headline'])}</h3><p>{escape(w['what_breaks'])}</p>"
+                           f"<p><strong>Right now:</strong> {escape(w['count_line'])}</p>"
+                           f"<p><strong>Before applying:</strong> {escape(w['before_applying'])}</p>"
+                           f"<p><strong>After applying:</strong> {escape(w['after_applying'])}</p>"
+                           for fid, _, w in warnings) + "</section>")
+        files["report.html"] = files["report.html"].decode().replace(
+            "<h1>Combined DBA review</h1>", "<h1>Combined DBA review</h1>" + block, 1).encode()
+    # E2E Gate 1, decision 2: one command for the whole package (sh harden.sh apply-all),
+    # with the runner's own files, the apply order it reads and a top-level manifest that
+    # is always written and covers every top-level file the runner allows.
+    package_fixes = [{"fix_id": folder, "folder": folder, "requires": cfg.get("requires") or "none",
+                      "client_impact": bool(cfg.get("client_impact")),
+                      **({"restart_round": rnd} if (cfg.get("requires") == "restart" and rnd) else {})}
+                     for folder, cfg, rnd in configs]
+    # Every per-fix fix.json carries the target's identity (review_bundle); take it from there.
+    first = configs[0][1]
+    files.update(package_assets.package_files())
+    files["package.json"] = package_assets.package_json(
+        output["run_id"], first.get("database"), package_fixes,
+        system_identifier=first.get("system_identifier"), target_id=first.get("target_id"),
+        demo_fixture_approval=bool(output.get("demo_fixture_approval")))
+    files["README.txt"] += package_assets.readme_text(package_fixes, bool(output.get("demo_fixture_approval"))).encode()
+    files["manifest.json"] = json.dumps({
+        "schema_version": "review-bundle-v1", "run_id": output["run_id"],
+        "demo_fixture_approval": output["demo_fixture_approval"], "requires_dba_review": True,
+        "snapshot_hash": output["snapshot_hash"], "spec_set_hash": engine.spec_set_hash,
+        "files": package_assets.manifest_entries(files)}, indent=2).encode()
     data = io.BytesIO()
     with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as z:
         for name, content in files.items():

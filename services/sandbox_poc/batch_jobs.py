@@ -48,15 +48,18 @@ class BatchJob:
         self.step_text = "Starting…"
         self.steps = []
         self.result = None
-        # Work units: one per individual test, one per fix in each combined test,
-        # one undo per combined test, one for the package.
+        # Work units (Melvin, 12 Nov: combined first): one per fix prepared (no sandbox), one
+        # per fix in each combined test, one undo per combined test, one per single test that
+        # actually runs (only after a combined failure), one for the package.
         self.fixes = fixes
-        self.individual_done = 0
-        self.passing = 0
+        self.prepared_done = 0
+        self.prepared_ok = 0
+        self.singles_started = 0
+        self.singles_done = 0
         self.attempts = []  # [{"size", "done", "finished"}]
         self.package_done = 0
-        self._individual_started = None
-        self._individual_seconds = []
+        self._single_started = None
+        self._single_seconds = []
         self._combined_last = None
         self._combined_seconds = []
 
@@ -66,15 +69,18 @@ class BatchJob:
         with self.lock:
             if kind == "plan":
                 self.fixes = event.get("count", self.fixes)
-            elif kind == "individual_start":
-                self._individual_started = now
-            elif kind == "individual_done":
-                self.individual_done += 1
-                if self._individual_started is not None:
-                    self._individual_seconds.append(now - self._individual_started)
-                    self._individual_started = None
+            elif kind == "prepare_done":
+                self.prepared_done += 1
                 if event.get("status") == "PASSED":
-                    self.passing += 1
+                    self.prepared_ok += 1
+            elif kind == "individual_start":
+                self.singles_started += 1
+                self._single_started = now
+            elif kind == "individual_done":
+                self.singles_done += 1
+                if self._single_started is not None:
+                    self._single_seconds.append(now - self._single_started)
+                    self._single_started = None
             elif kind == "combined_start":
                 self.attempts.append({"size": event.get("count", 0), "done": 0, "finished": False})
                 self._combined_last = now
@@ -112,35 +118,43 @@ class BatchJob:
 
     def _counts(self) -> tuple[int, int]:
         if not self.attempts:
-            # No combined test yet: assume every fix still in the race reaches it.
-            combined_total = self.passing + (self.fixes - self.individual_done)
+            # No combined test yet: assume every fix still being prepared reaches it.
+            combined_total = self.prepared_ok + (self.fixes - self.prepared_done)
             undo = 1
         else:
             combined_total = sum(a["done"] if a["finished"] else a["size"] for a in self.attempts)
             undo = len(self.attempts)
-        total = self.fixes + combined_total + undo + 1
-        done = (self.individual_done + sum(a["done"] for a in self.attempts)
+        total = self.fixes + self.singles_started + combined_total + undo + 1
+        done = (self.prepared_done + self.singles_done + sum(a["done"] for a in self.attempts)
                 + sum(1 for a in self.attempts if a["finished"]) + self.package_done)
         if self.status != RUNNING:
             return total, total
         return min(done, total), total
 
     def _estimate(self) -> int | None:
-        """Seconds left, from the average time per step measured so far in this batch."""
-        if self.status != RUNNING or not self._individual_seconds:
-            return 0 if self.status != RUNNING else None
-        individual = sum(self._individual_seconds) / len(self._individual_seconds)
-        # Before any combined step is timed, assume half an individual test per fix.
-        combined = (sum(self._combined_seconds) / len(self._combined_seconds)
-                    if self._combined_seconds else individual / 2)
-        left_individual = self.fixes - self.individual_done
+        """Seconds left, from the time per combined step measured so far in this batch.
+
+        Unknown (None) until the first combined step is timed. While a single test runs (only
+        after a combined failure) it is assumed to take as long as the last one, else as long
+        as applying and undoing the whole combined test, followed by a retry without that fix."""
+        if self.status != RUNNING:
+            return 0
+        if not self._combined_seconds:
+            return None
+        step = sum(self._combined_seconds) / len(self._combined_seconds)
         if not self.attempts:
-            left_combined = self.passing + left_individual
+            left_combined = self.prepared_ok + (self.fixes - self.prepared_done)
         else:
             current = self.attempts[-1]
             left_combined = 0 if current["finished"] else current["size"] - current["done"]
+        single = 0.0
+        if self.singles_started > self.singles_done:
+            size = self.attempts[-1]["size"] if self.attempts else 1
+            single = (sum(self._single_seconds) / len(self._single_seconds) if self._single_seconds
+                      else step * size * 2)
+            single += max(size - 1, 0) * step * 2 + step  # the retry without it
         # Undoing takes about as long as applying; the package is about one step.
-        return round(left_individual * individual + left_combined * combined * 2 + combined)
+        return round(left_combined * step * 2 + step + single)
 
     def progress(self) -> dict:
         with self.lock:

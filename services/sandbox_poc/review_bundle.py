@@ -551,6 +551,318 @@ def build_catalog_review_bundle(handoff, result, engine):
     return buffer.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# Combined package folders (Melvin's ruling of 12 Nov 2026: combined test first). A fix's
+# folder is built from its no-sandbox preparation (SandboxService.prepare) and the FINAL
+# VERIFIED combined test's records for it: its step (before / after), its verified undo and
+# the verified cleanup. Same members, fix.json fields and manifest rules as the bundles above.
+# ---------------------------------------------------------------------------
+
+_HARDEN_SH = b'#!/bin/sh\nset -eu\nBUNDLE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec python3 "$BUNDLE_DIR/runner.py" "$@"\n'
+_VERIFY_SH = b'#!/bin/sh\nset -eu\nBUNDLE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec python3 "$BUNDLE_DIR/runner.py" verify "$@"\n'
+_STYLE = ('body{font:15px/1.5 system-ui;margin:32px;color:#21343b;max-width:1100px}table{border-collapse:collapse;width:100%}'
+          'td,th{padding:10px;border:1px solid #cbd5db;text-align:left;overflow-wrap:anywhere}th{background:#eaf4f1}'
+          'pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f4f6;padding:16px}.notice{padding:16px;background:#fff3d9}')
+
+
+def _no_images(value):
+    """A deep copy without base64 images; every other field (and each image's sha256) stays."""
+    if isinstance(value, dict):
+        return {k: _no_images(v) for k, v in value.items() if k != 'png_base64'}
+    if isinstance(value, list):
+        return [_no_images(v) for v in value]
+    return copy.deepcopy(value)
+
+
+def _check_prepared(handoff, prepared, engine):
+    """The prepared fix is bound to this handoff, these specs, this profile and the pinned template."""
+    require(prepared.get('approval_source') == 'registry', 'registry approval evidence is required')
+    require(prepared.get('snapshot_hash') == digest(handoff.snapshot), 'snapshot identity mismatch')
+    require(prepared.get('spec_set_hash') == engine.spec_set_hash == handoff.spec_set_hash, 'spec identity mismatch')
+    require(prepared.get('spec_hashes') == engine.hashes and prepared.get('collector_hash') == engine.collector_hash,
+            'collector/spec evidence mismatch')
+    require(prepared.get('policy_profile') == engine.policy_pin, 'policy profile differs from the tested run')
+    require(prepared.get('fix_unit_hash') == digest(prepared['fix_unit']), 'fix-unit identity mismatch')
+    template, ref = prepared['template'], handoff.template_ref
+    require(template['registry_name'] == ref.registry_name and template['version'] == ref.version
+            and template['sha256'] == ref.sha256, 'selected template was not pinned in the handoff')
+    pins = [{k: e.get(k) for k in ('document_id', 'version', 'sha256')} for e in template['evidence']]
+    require(pins == [p.model_dump() for p in ref.evidence], 'evidence reference mismatch')
+
+
+def build_combined_fix_files(handoff, prepared, step, record, engine, *, prior_snapshot, applied_snapshot,
+                             package_run_id, position, total, client_impact=False, single=None):
+    """{member: bytes} of one fix's folder in the combined package, from combined records.
+
+    ``step`` is this fix's step of ``record``, the final combined test, which must be
+    VERIFIED with this fix's undo and the sandbox's removal verified. ``prior_snapshot`` and
+    ``applied_snapshot`` are the states the runner's guard expects on the target before and
+    after this fix (batch._bundle_states). ``single`` is this fix's own sandbox test, when one
+    ran (the restart culprit search), and is reported as well.
+    """
+    kind = prepared.get('kind')
+    require(kind in (None, 'object', 'catalog_setting'), 'unsupported fix kind')
+    require((kind == 'object') == bool(getattr(handoff, 'object_fix_id', None)), 'fix kind differs from the handoff')
+    require(record.get('status') == 'VERIFIED' and (record.get('cleanup') or {}).get('verified') is True,
+            'only a VERIFIED combined test whose sandbox removal was verified is exportable')
+    _check_prepared(handoff, prepared, engine)
+    fix = prepared['fix_unit']
+    fix_id, control = fix['fix_id'], handoff.control_id
+    require(step.get('fix_id') == fix_id, 'combined step differs from the fix')
+    undo = [e for e in record.get('rollback') or [] if e.get('fix_id') == fix_id]
+    require(len(undo) == 1 and undo[0].get('verified') is True, 'the exact undo of this fix was not verified')
+    before, after = step['before'], step['after']
+    require(step.get('assessment') == engine.assess(after), 'assessment does not match the snapshot')
+    require(not blocking_gaps(before) and not blocking_gaps(after), 'collection has gaps')
+    require((step.get('functional_checks') or {}).get('passed') is True, 'functional checks did not pass')
+    common = {'fix_id': fix_id, 'database': handoff.snapshot['envelope']['database'],
+              'demo_fixture_approval': is_fixture(prepared), 'run_id': record['run_id'],
+              'combined_run_id': package_run_id, 'control_id': control,
+              'target_id': handoff.snapshot['envelope']['target_id'],
+              'system_identifier': handoff.snapshot['baseline'].get('identity', {}).get('system_identifier'),
+              'spec_set_hash': engine.spec_set_hash, 'snapshot_hash': prepared['snapshot_hash'],
+              'policy_profile': engine.policy_pin, 'client_impact': bool(client_impact)}
+    after_restart = step.get('verification') == 'AFTER_RESTART'
+    if after_restart:
+        require((step.get('verified_after_restart') or {}).get('status') == 'PASS', 'deferred check did not pass')
+    if kind == 'object':
+        from . import object_fixes
+        from .catalog_skeleton import target_key
+        from .shared import ROOT, validate_contract
+        from .workflow import object_statements
+        proposal = prepared['proposal']
+        if (ROOT / 'catalog/specs/contracts/fix-unit-v2.json').is_file():
+            validate_contract(fix, 'fix-unit-v2.json')
+        require(fix_id == proposal['fix_id'] == handoff.object_fix_id, 'fix differs from the selected object fix')
+        require(fix['spec_id'] == proposal['spec_id'] == control and fix['requires'] == 'none', 'unsupported fix')
+        require(object_fixes.resolve(engine, handoff.snapshot, engine.policy_pin, fix_id) == proposal,
+                'proposal differs from the evidence-derived proposal')
+        require(prepared['template']['registry_name'] == proposal['fix_type'], 'template differs from the fix type')
+        apply, rollback = object_statements({'apply': fix['apply']['statements'],
+                                             'rollback': fix['rollback']['statements']}, proposal['fix_type'])
+        require(prepared['rendered_apply_sql'] == '\n'.join(apply)
+                and prepared['rendered_rollback_sql'] == '\n'.join(rollback), 'rendered statements differ from the fix unit')
+        require(all(re.fullmatch(object_fixes.STATEMENT_SHAPES[(proposal['fix_type'], action)], sql)
+                    for action, statements in (('apply', apply), ('rollback', rollback)) for sql in statements),
+                'a statement is outside the reviewed template shape')
+        require(prepared.get('source_object_signature') == object_fixes.object_signature(proposal, handoff.snapshot),
+                'source object signature differs')
+        require(not object_fixes.predicate(proposal, before) and object_fixes.predicate(proposal, after),
+                'object predicate evidence is invalid')
+        prior, applied = object_fingerprint(proposal, prior_snapshot), object_fingerprint(proposal, applied_snapshot)
+        predicate = fix['verify']['predicate']
+        config = {'kind': 'object', **common, 'fix_type': fix['fix_type'], 'object_key': target_key(proposal),
+                  'requires': 'none', 'transactional': True, 'target': proposal['target'], 'prior': prior,
+                  'applied': applied, 'proposal_prior': proposal['prior'], 'predicate': predicate,
+                  'apply_statements': apply, 'rollback_statements': rollback}
+        apply_sql, rollback_sql = prepared['rendered_apply_sql'], prepared['rendered_rollback_sql']
+        title = proposal.get('title') or fix_id
+        state_rows = ''.join(f'<tr><td>{escape(label)}</td><td><pre>{escape(json.dumps(object_fingerprint(proposal, s), indent=2))}</pre></td></tr>'
+                             for label, s in (('Before this fix (combined copy)', before), ('After this fix', after)))
+        detail = (f'<h2>{escape(title)}</h2><p>{escape(str(proposal.get("explanation") or ""))}</p>'
+                  f'<p><strong>Proof checked after the fix:</strong> {escape(predicate)}</p>'
+                  '<p class="notice"><strong>What was rehearsed:</strong> the fix on a stand-in copy of this object '
+                  '(same name, owner, attributes and permissions) in a disposable sandbox. No real data, no function '
+                  'bodies and no real passwords were copied. <strong>What was not rehearsed:</strong> how your '
+                  'applications use this object.</p><h2>Object state in the combined sandbox</h2><table><tr><th>Phase'
+                  f'</th><th>Object</th></tr>{state_rows}</table>')
+        readme_fix = f'Fix: {title}\nProof checked after the fix: {predicate}\n{OBJECT_REHEARSAL_TEXT}'
+        extra_readme, sandbox_limit = '', None
+    elif kind == 'catalog_setting':
+        from . import catalog_fixes as cf
+        from .workflow import list_template_action
+        require(not getattr(handoff, 'object_fix_id', None) and not handoff.retry_template_refs, 'unsupported handoff')
+        scope = cf.catalog_fix_scope(engine, handoff.snapshot, control)
+        require(fix == cf.build_fix(scope, fix['template_version'], fix.get('list_template_version')),
+                'fix differs from the evidence-derived catalog fix')
+        require(prepared['template']['registry_name'] == cf.TEMPLATE_NAME and prepared['template']['version']
+                == fix['template_version'], 'selected template was not pinned in the handoff')
+        list_ref, list_template = handoff.list_template_ref, prepared.get('list_template')
+        require((list_ref is None) == (list_template is None) == ('list_template_id' not in fix), 'list template pin mismatch')
+        if list_ref is not None:
+            require(list_ref.registry_name == list_template['registry_name'] == cf.LIST_TEMPLATE
+                    and list_template['version'] == list_ref.version == fix['list_template_version']
+                    and list_template['sha256'] == list_ref.sha256
+                    and [{k: e.get(k) for k in ('document_id', 'version', 'sha256')} for e in list_template['evidence']]
+                    == [p.model_dump() for p in list_ref.evidence], 'list template was not pinned in the handoff')
+        # In the combined order a preload fix is re-derived from the state the earlier fixes
+        # leave (W2B rulings round 3); the step records the unit and SQL it actually ran.
+        unit = step.get('fix_unit')
+        require(isinstance(unit, dict) and unit.get('fix_id') == fix_id and unit.get('spec_id') == fix['spec_id']
+                and bool(step.get('chained')) == (unit != fix), 'combined step differs from the catalog fix')
+        if unit != fix:
+            require(unit == cf.build_fix(cf.catalog_fix_scope(engine, before, control, engine.assess(before)),
+                                         fix['template_version'], unit.get('list_template_version')),
+                    'chained fix differs from the fix derived from the combined state')
+        statements = step.get('rendered_apply_statements') or []
+        require(len(statements) == len(unit['changes']), 'rendered statements differ from the fix')
+        apply = []
+        for sql, change in zip(statements, unit['changes']):
+            if change['template'] == cf.LIST_TEMPLATE:
+                action = list_template_action(sql)
+                require(action == change['apply'], 'typed action differs from tested list template')
+                apply += render_action(action)
+            else:
+                require(template_action(sql, change['param']) == change['apply'], 'typed action differs from tested template')
+                apply += canonical_apply(sql, change['param'], change['apply']['value'])
+        rollback_sql = cf.rollback_sql(unit)
+        require(step.get('rendered_rollback_sql') == rollback_sql, 'rendered rollback differs')
+        proof = cf.proof(engine, scope['spec'], after)
+        require(step.get('catalog_proof') == proof and proof['result'] == 'PASS', 'catalog check proof is invalid')
+        if scope['tls'] and step.get('phase') == 1:
+            require('tls_after' in step and cf.tls_fixed(step['tls_after']), 'TLS handshake evidence is invalid')
+        names = list(dict.fromkeys(prepared['names'] + [c['param'] for c in unit['changes']]))
+        prior, applied = cf.catalog_signature(prior_snapshot, names), cf.catalog_signature(applied_snapshot, names)
+        require(all(applied['settings'].get(c['param'], {}).get('setting') == c['expected_value'] for c in unit['changes']),
+                'the fix values are not the applied values')
+        config = {'kind': 'catalog_setting', **common, 'names': names, 'prior': prior, 'applied': applied,
+                  'setting': unit['changes'][0]['param'], 'settings': [c['param'] for c in unit['changes']],
+                  'requires': fix['requires'], 'preload_added': list(unit['preload_added']),
+                  'apply_statements': apply,
+                  'rollback_statements': [s + ';' for c in reversed(unit['changes']) for s in render_action(c['rollback'])]}
+        if unit != fix:
+            config['combined_order_fix_unit'] = unit
+        apply_sql = '\n'.join(statements)
+        link, title = scope['link'], scope['spec']['ref']['title']
+        changes_html = ''.join(f'<tr><td>{escape(c["param"])}</td><td>{escape(str((c["prior_state"] or {}).get("value", "(not defined)")))}</td>'
+                               f'<td>{escape(c["expected_value"])}</td></tr>' for c in unit['changes'])
+        from app.services.spec_engine.catalog_checks import notices_for
+        extra_readme = ((PRELOAD_README.format(libs=', '.join(unit['preload_added'])) if unit['preload_added'] else '')
+                        + (TLS_README if scope['tls'] else ''))
+        chained_html = ('<h2>Combined order</h2><p class="notice">In this package the fix was derived from the state the '
+                        'fixes before it leave, so its SQL keeps what they added and differs from a test of this fix on '
+                        'its own. harden.sh runs exactly the SQL below.</p>' if unit != fix else '')
+        detail = (f'<h2>CIS {escape(link["recommendation"])}: {escape(title)}</h2>{chained_html}<table><tr><th>Setting</th>'
+                  f'<th>Before</th><th>Fix value</th></tr>{changes_html}</table>'
+                  + (f'<p class="notice">{escape(extra_readme.strip())}</p>' if extra_readme else '')
+                  + '<h2>Proof: the CIS check in the combined sandbox</h2><table><tr><th>Phase</th><th>Result</th>'
+                  '<th>Reason</th></tr>'
+                  + ''.join(f'<tr><td>{escape(label)}</td><td>{escape(p["result"])}</td><td>{escape(str(p["code"]))}</td></tr>'
+                            for label, p in (('Before this fix', cf.proof(engine, scope['spec'], before)),
+                                             ('After this fix', proof)))
+                  + '</table>' + ''.join(f'<p class="notice">{escape(n["text"])}</p>' for n in notices_for(link['recommendation'])))
+        readme_fix = (f'Fix: CIS {link["recommendation"]} {title}\n'
+                      'Proof: the CIS check gave PASS right after the fix was applied in the combined sandbox.\n')
+        sandbox_limit = None
+    else:
+        from .planning import SANDBOX_LIMITS, fix_scope
+        _, name, value = fix_scope(engine, control)
+        require(not validate_fix_unit(fix), 'upstream fix-unit validation failed')
+        require(fix['spec_id'] == control and fix['fix_id'] == 'fix-' + name and fix['requires'] in ('reload', 'restart'),
+                'unsupported fix')
+        require(fix['apply'] == template_action(prepared['rendered_apply_sql'], name) and fix['apply']['value'] == value,
+                'typed action differs from the approved template or the reviewed fix value')
+        require(fix['rollback'] == derive_rollback(fix['prior_state'], fix['apply']), 'rollback differs from source-aware plan')
+        row = setting_rows(handoff.snapshot)[name]
+        require(fix['prior_state'] == {k: row.get(v) for k, v in {'value': 'setting', 'source': 'source',
+                                                                   'sourcefile': 'sourcefile', 'context': 'context'}.items()},
+                'prior state differs from source')
+        require(prepared['rendered_rollback_sql'] == render_action_script(fix['rollback']), 'rendered rollback differs')
+        if not after_restart:
+            require(step['assessment']['findings'][control]['status'] == 'PASS', 'target did not pass')
+        names = [s['check']['setting_name'] for s in engine.specs if 'check' in s and s['check'].get('kind') != 'catalog']
+        prior, applied = signature(prior_snapshot, names), signature(applied_snapshot, names)
+        config = {**common, 'names': names, 'prior': prior, 'applied': applied, 'setting': name,
+                  'requires': fix['requires'],
+                  'apply_statements': canonical_apply(prepared['rendered_apply_sql'], name, value),
+                  'rollback_statements': [s + ';' for s in render_action(fix['rollback'])]}
+        apply_sql, rollback_sql = prepared['rendered_apply_sql'], prepared['rendered_rollback_sql']
+        b_report, a_report = engine.assess(before), step['assessment']
+        from app.services.spec_engine.catalog_checks import notices_for
+        rows = ''.join('<tr>' + ''.join(f'<td>{escape(str(x))}</td>' for x in (
+            s['spec_id'], s['ref']['title'], b_report['findings'][s['spec_id']]['status'],
+            a_report['findings'][s['spec_id']]['status'])) + '</tr>' for s in engine.specs if s['spec_id'] in b_report['findings'])
+        detail = ('<h2>Before / after this fix in the combined sandbox</h2><div class="table"><table><tr><th>Control</th>'
+                  f'<th>Title</th><th>Before this fix</th><th>After this fix</th></tr>{rows}</table></div>'
+                  + ''.join(f'<p class="notice">{escape(s["spec_id"])}: {escape(n["text"])}</p>' for s in engine.specs
+                            if s['spec_id'] in b_report['findings'] for n in notices_for(s['ref']['recommendation'])))
+        readme_fix, extra_readme = f'Fix: {name} = {value} (CIS {control.split(":", 1)[-1]})\n', ''
+        sandbox_limit = SANDBOX_LIMITS.get(name)
+    require(applied != prior, 'the fix did not change what the runner checks')
+    demo = common['demo_fixture_approval']
+    risk = prepared['risk_review']
+    scope_line = 'DEMO FIXTURE APPROVAL — not human approval' if demo else 'Registry-approved template and evidence — DBA review still required'
+    profile_line = approval_text(engine.policy_pin)
+    phase = step.get('phase')
+    where = (f'step {position} of {total}, phase 2 (written with the other restart fixes of restart round '
+             f'{step.get("restart_round", 1)}, then checked after one restart of the sandbox)' if phase == 2
+             else f'step {position} of {total}, phase 1 (no restart)')
+    tested = (f'Tested in the combined run {record["run_id"]}: applied as {where} on a disposable copy that already '
+              'held every fix before it in the package order; checked right after it was applied'
+              + (', and its own check again after the restart that switched its prerequisite on' if after_restart else '')
+              + '; undone in reverse order'
+              + (' together with its restart round (one restart)' if phase == 2 else '')
+              + ' with the exact earlier state verified; the copy was removed and its removal verified.')
+    single_line = ''
+    if single is not None:
+        single_line = (f'Also tested on its own in sandbox run {single.get("run_id")}: {single.get("status")} '
+                       '(after PostgreSQL did not start in an earlier combined attempt, to find the cause).')
+    limit_html = f'<p class="notice"><strong>Sandbox limit:</strong> {escape(sandbox_limit)}</p>' if sandbox_limit else ''
+    report = (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+              f'content="width=device-width,initial-scale=1"><title>DBGuardAI review report</title><style>{_STYLE}'
+              f'</style></head><body><h1>DBGuardAI · DBA review</h1><p class="notice">{escape(scope_line)}</p>{limit_html}'
+              '<p>Sandbox status: VERIFIED in the combined test. Target application and real-target reassessment: '
+              f'NOT PERFORMED.</p><p class="notice">{escape(tested)}</p>'
+              + (f'<p>{escape(single_line)}</p>' if single_line else '')
+              + f'<p>Combined sandbox run: {escape(record["run_id"])}<br>Package: {escape(package_run_id)}<br>'
+              f'Source: {escape(handoff.snapshot["envelope"]["target_id"])}<br>Spec set: {escape(engine.spec_set_hash)}<br>'
+              f'{escape(profile_line)}</p>{detail}<h2>Risk and prerequisites</h2><pre>{escape(json.dumps(risk, indent=2))}</pre>'
+              '<h2>DBA verification</h2><p>Run verify.sh after each complete fix. It opens fresh connections and checks '
+              'the state this fix leaves. The guard expects the fixes before it in the package order to remain applied. '
+              'Run the listed application checks separately.</p>'
+              f'<h2>Reviewed apply SQL</h2><pre>{escape(apply_sql)}</pre><h2>Rollback SQL</h2><pre>{escape(rollback_sql)}</pre>'
+              '<h2>Limits</h2><p>PostgreSQL 17; reviewed fixes from approved, hash-pinned templates only. Restart settings '
+              'require a DBA-controlled restart on the target. Regression coverage is limited to the supplied specs. The '
+              'runner checks the PostgreSQL version, database, cluster identity and the exact prior state, and refuses '
+              'drift. After applying, recollect and reassess the target using the same specs. combined-evidence.json at '
+              'the top of the package holds the whole combined test.</p></body></html>')
+    evidence = {'handoff': handoff.model_dump(), 'prepared': _no_images(prepared),
+                'combined_test': {'run_id': record['run_id'], 'package_run_id': package_run_id, 'status': record['status'],
+                                  'position': position, 'total': total, 'step': _no_images(step), 'rollback': undo,
+                                  'restarts': record.get('restarts', 0), 'cleanup': record.get('cleanup')},
+                'single_test': ({k: single.get(k) for k in ('run_id', 'status')} if single is not None else None)}
+    files = {}
+    visual = (step.get('functional_checks') or {}).get('screenshot') or {}
+    if visual.get('status') == 'CAPTURED':
+        # The rendered picture of this step's fresh verification queries (DBGUARD_SCREENSHOTS,
+        # never inside a background batch), checked against its recorded sha256.
+        try:
+            png = base64.b64decode(visual.get('png_base64') or '', validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            raise ContractError('Review bundle: screenshot is not valid base64') from None
+        require(hashlib.sha256(png).hexdigest() == visual.get('sha256'), 'screenshot hash mismatch')
+        files['sandbox-after.png'] = png
+        files['sandbox-queries.json'] = json.dumps(visual.get('query_evidence'), indent=2).encode()
+        report = report.replace('</body>', '<h2>Actual sandbox database results</h2><p>Browser capture of the query '
+                                'evidence viewer, from fresh database queries right after this fix in the combined '
+                                'sandbox.</p><img style="max-width:100%" src="sandbox-after.png" alt="Sandbox '
+                                'verification query results"></body>', 1)
+    files.update({'fix.json': json.dumps(config, indent=2).encode(),
+                  'evidence.json': json.dumps(evidence, indent=2).encode(),
+                  'report.html': report.encode(), 'runner.py': (ASSETS / 'runner.py').read_bytes(),
+                  'harden.sh': _HARDEN_SH, 'risk-review.json': json.dumps(risk, indent=2).encode(),
+                  'visual_evidence.py': (ASSETS / 'visual_evidence.py').read_bytes(), 'verify.sh': _VERIFY_SH})
+    manifest = {'schema_version': 'review-bundle-v1', 'run_id': record['run_id'], 'demo_fixture_approval': demo,
+                'requires_dba_review': True, 'snapshot_hash': prepared['snapshot_hash'], 'spec_set_hash': engine.spec_set_hash,
+                'files': {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+    files['manifest.json'] = json.dumps(manifest, indent=2).encode()
+    limit_text = f'SANDBOX LIMIT: {sandbox_limit}\n\n' if sandbox_limit else ''
+    files['README.txt'] = (
+        f'{scope_line}\n{profile_line}\n\n{limit_text}{readme_fix}{extra_readme}\n{tested}\n'
+        + (f'{single_line}\n' if single_line else '')
+        + f'\nThis folder is one fix of a combined package: apply the package in its order (sh ../harden.sh apply-all),\n'
+        'or this fix by hand only after the fixes before it. Review report.html, evidence.json and both SQL\n'
+        'commands before any execution.\nRequires Python 3 and psycopg2 (requirements-sandbox.txt includes psycopg2-binary).\n'
+        'Set DBGUARD_DSN to the DBA-verified target using your normal credential handling.\n'
+        f'No credentials are included. Verify server identity separately.\n\nsh harden.sh status {fix_id}\n'
+        f'sh harden.sh apply {fix_id} --ack-prerequisites\nsh harden.sh rollback {fix_id}\n\nsh verify.sh {fix_id}\n\n'
+        'The runner checks PostgreSQL version, database name, cluster identity and the exact prior state before apply\n'
+        'or rollback. It never applies automatically. Recollect the target with the original collector and reassess\n'
+        'via the application. Demo bundles require --allow-demo and must only be used with disposable databases.\n'
+        'The manifest detects accidental changes, not forgery.\n').encode()
+    return files
+
+
 class BundleStore:
     """Bounded process-local downloads; only server-created ZIPs enter this store."""
     def __init__(self, capacity=8):

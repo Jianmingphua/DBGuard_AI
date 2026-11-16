@@ -168,40 +168,50 @@ def test_combined_test_takes_three_pictures_for_the_whole_batch(engine, planted,
     applies = [i for i, s in enumerate(executed) if s.startswith("BEGIN;\nALTER") or s.startswith("BEGIN;\nREVOKE")]
     before, after, back = (c["executed"] for c in combined_calls)
     assert before <= applies[0] and applies[len(proposals) - 1] < after < back
-    # Each individual run took its own three single-geometry pictures.
-    for runtime in runtimes[:-1]:
-        own = [c for c in spy.calls if c["run_id"] == runtime.run_id]
-        assert [c["stage"] for c in own] == ["before", "after", "rollback"]
-        assert all(c["geometry"] == "single" for c in own)
+    # Combined first (12 Nov): every fix passed together, so none ran a test of its own and
+    # no single-geometry picture was taken.
+    assert output["individual_runs"] == [] and len(runtimes) == 1
+    assert all(c["run_id"] == combined_id for c in spy.calls)
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         files = {name: z.read(name) for name in z.namelist()}
     manifest = json.loads(files["manifest.json"])
     shots = {f"screenshots/combined-{s}.png": png_for(combined_id, s) for s in ("before", "after", "rollback")}
-    assert set(manifest["files"]) == {"combined-evidence.json", "report.html", *shots}
+    # E2E Gate 1 decision 2 (10 Nov): the top-level manifest also covers the one-command
+    # package files (harden.sh, package_runner.py, ...), and README.txt is never hashed.
+    from services.sandbox_poc import package_assets
+    package = set(package_assets.REQUIRED_FILES)
+    # E2E Gate 1 decision 3: a fix that can lock out clients (here the 5.5 connection
+    # limit) adds CLIENT-ACTIONS.txt, which the manifest covers too.
+    actions = {"CLIENT-ACTIONS.txt"} if "CLIENT-ACTIONS.txt" in files else set()
+    assert set(manifest["files"]) == {"combined-evidence.json", "report.html", *shots, *package, *actions}
     for name, png in shots.items():
         assert files[name] == png and manifest["files"][name] == sha(png)
         assert name in files["README.txt"].decode() and f'src="{name}"' in files["report.html"].decode()
     assert manifest["files"]["report.html"] == sha(files["report.html"])
     assert manifest["files"]["combined-evidence.json"] == sha(files["combined-evidence.json"])
     assert not any(n.startswith("screenshots/") and n not in shots for n in files)
-    # Per-fix folders carry that fix's own isolated-test pictures in their own manifest.
-    sandboxes = []
-    for result in output["individual_runs"]:
-        prefix = result["fix_id"] + "/"
+    # Per-fix folders are built from the combined records: no pictures of their own (the
+    # combined test's three are at the top), every member hashed in the folder's manifest.
+    order = json.loads(files["package.json"])["fixes"]
+    assert sorted(f["fix_id"] for f in order) == sorted(p["fix_id"] for p in proposals)
+    for item in order:
+        prefix = item["folder"] + "/"
         fix_manifest = json.loads(files[prefix + "manifest.json"])
-        sandbox = json.loads(files[prefix + "evidence.json"])["result"]["attempts"][-1]["run_id"]
-        sandboxes.append(sandbox)
-        for stage in ("before", "after", "rollback"):
-            member = f"screenshots/{stage}.png"
-            assert files[prefix + member] == png_for(sandbox, stage)
-            assert fix_manifest["files"][member] == sha(files[prefix + member])
-    assert sorted(sandboxes) == sorted(r.run_id for r in runtimes[:-1])
-    # The per-fix DBA runner accepts its manifest, screenshots included (then stops at the DSN).
+        assert not any(n.startswith(prefix + "screenshots/") for n in files)
+        assert {n[len(prefix):] for n in files if n.startswith(prefix)} == set(fix_manifest["files"]) | {
+            "manifest.json", "README.txt"}
+        assert all(sha(files[prefix + name]) == digest for name, digest in fix_manifest["files"].items())
+        config = json.loads(files[prefix + "fix.json"])
+        assert config["run_id"] == combined_id and config["combined_run_id"] == output["run_id"]
+        evidence = json.loads(files[prefix + "evidence.json"])
+        assert evidence["combined_test"]["run_id"] == combined_id and evidence["single_test"] is None
+        assert f"Tested in the combined run {combined_id}" in files[prefix + "report.html"].decode()
+    # The per-fix DBA runner accepts its manifest (then stops at the DSN).
     folder = tmp_path / "unzipped"
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         z.extractall(folder)
-    first = folder / output["individual_runs"][0]["fix_id"]
-    out = subprocess.run([sys.executable, "-I", str(first / "runner.py"), "status", output["individual_runs"][0]["fix_id"]],
+    first = folder / order[0]["folder"]
+    out = subprocess.run([sys.executable, "-I", str(first / "runner.py"), "status", order[0]["fix_id"]],
                          cwd=first, env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=60)
     assert out.returncode == 1 and "Set DBGUARD_DSN explicitly" in out.stderr, out.stderr
 
@@ -221,14 +231,19 @@ def test_combined_capture_failure_keeps_the_batch_verdict_and_adds_no_files(engi
     assert all(s["status"] == "UNAVAILABLE" for s in stages.values())
     with zipfile.ZipFile(io.BytesIO(data)) as z, zipfile.ZipFile(io.BytesIO(base_data)) as b:
         assert set(z.namelist()) == set(b.namelist())
-        assert not any("screenshots/" in n for n in z.namelist()) and "manifest.json" not in z.namelist()
+        # E2E Gate 1 decision 2 replaced Task 2 Gate 2 ruling 3: the top-level manifest is
+        # now always written (it covers the package runner), but a failed capture adds no
+        # picture and no other file.
+        assert not any("screenshots/" in n for n in z.namelist()) and "manifest.json" in z.namelist()
 
 
 def test_combined_failure_marks_unreached_stages_and_keeps_its_verdict(engine, planted, monkeypatch, tmp_path):  # noqa: F811
     # Ruling of 10 Nov: a fix that fails in the combined test is left out and the rest are
-    # retried in a new sandbox. The fault is therefore on every combined sandbox (4, 5, 6: one
-    # per fix left out), so no fix is proven and the verdict is still not VERIFIED, no bundle.
-    faults = {4: "apply_error", 5: "apply_error", 6: "apply_error"}
+    # retried in a new sandbox. Since 12 Nov the combined test runs first and the failing fix
+    # then gets its own test, so the combined sandboxes are 1, 3 and 5 (2, 4, 6 are those
+    # single tests). The fault is on every combined sandbox, so no fix is proven and the
+    # verdict is still not VERIFIED, no bundle.
+    faults = {1: "apply_error", 3: "apply_error", 5: "apply_error"}
     set_terminal(monkeypatch, on=False)
     base, _, _, _ = run_batch(engine, planted, monkeypatch, tmp_path, faults=faults)
     set_terminal(monkeypatch)

@@ -1,5 +1,6 @@
 """Synchronous local POC endpoint shared by standalone and existing API apps."""
 import logging
+import uuid
 
 import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File, Form
@@ -229,13 +230,16 @@ def fix_plan(snapshot_id: str, benchmark_id: str = Query(default='cis-pg17-v1.1.
         return {'snapshot_id':snapshot_id,'spec_set_hash':engine.spec_set_hash,'policy_profile':getattr(engine,'policy_pin',None),'recommended_order':recommend_order(fixes),'manual_review':manual,'not_applicable':not_applicable,
                 'object_proposals':object_proposals,'object_template_versions':object_template_versions,
                 'list_template_version':list_template_version,
-                'ordering_basis':'Dependencies first, then lower operational risk; DBA decides security urgency and final order.'}
+                'ordering_basis':'Fixes that need no restart first, then fixes that need a restart (a batch restarts its sandbox once for all of them); lower operational risk first within each group. A fix that only takes effect with logging_collector on is checked again after that restart. DBA decides security urgency and final order.'}
     except SnapshotNotFoundError: raise HTTPException(404,'Snapshot not found') from None
     except ContractError as exc: raise HTTPException(422,str(exc)) from exc
 
 
 @router.get('/api/v1/history')
 def run_history():
+    # A batch whose service process died is shown INTERRUPTED, not RUNNING for ever.
+    from . import batch_jobs
+    batch_jobs.reconcile()
     return {'runs':history.list_runs()}
 
 
@@ -279,6 +283,30 @@ def reassess_run(run_id: str, request: ReassessmentRequest, store: SnapshotStore
     except (ContractError,SnapshotNotFoundError) as exc: raise HTTPException(422,str(exc)) from exc
 
 
+@router.post('/api/v1/history/{run_id}/target-evidence')
+async def target_evidence_upload(run_id: str, file: UploadFile = File(...)):
+    """The DBA's target-evidence zip from the package (E2E Gate 1, decision 2), checked
+    against the run's own database and cluster identity before it is stored."""
+    from . import target_evidence
+    data=await file.read(target_evidence.MAX_ZIP+1)
+    try:
+        receipt=target_evidence.check(data,run_id,history.get(run_id))
+        history.event(run_id,'TARGET_EVIDENCE_UPLOADED',receipt)
+        return target_evidence.public(receipt,images=False)
+    except ContractError as exc: raise HTTPException(422,str(exc)) from exc
+
+
+@router.get('/api/v1/history/{run_id}/target-evidence')
+def target_evidence_latest(run_id: str):
+    """The latest accepted target-evidence upload for a run, with its pictures."""
+    from . import target_evidence
+    try: events=history.get(run_id)['events']
+    except ContractError as exc: raise HTTPException(404,str(exc)) from exc
+    latest=[e['data'] for e in events if e['kind']=='TARGET_EVIDENCE_UPLOADED']
+    if not latest: raise HTTPException(404,'No target evidence uploaded for this run')
+    return target_evidence.public(latest[-1])
+
+
 @router.post('/api/v1/history/{run_id}/evidence')
 async def manual_evidence(run_id: str, control_id: str = Form(...), operator: str = Form(...), file: UploadFile = File(...)):
     import hashlib,base64
@@ -296,8 +324,14 @@ async def manual_evidence(run_id: str, control_id: str = Form(...), operator: st
 
 
 class BatchRequest(BaseModel):
-    fixes: list[PrepareRequest] = Field(min_length=2,max_length=6)
-    requested_order: list[str] | None = Field(default=None,max_length=6)
+    # Melvin (10 Nov): at least one fix and no fixed upper number. Every fix must be one this
+    # snapshot's fix plan offers (prepare_uploaded / plan_batch refuse anything else, at the
+    # first such fix), each at most once, so the bound is the number of offered fixes.
+    fixes: list[PrepareRequest] = Field(min_length=1)
+    requested_order: list[str] | None = None
+    # "Test fixes for all failed checks": a conflicting fix is reported NOT_ELIGIBLE
+    # instead of refusing the whole request.
+    fix_all: bool = False
 
     @model_validator(mode='after')
     def _unique_fixes(self):
@@ -307,18 +341,70 @@ class BatchRequest(BaseModel):
         return self
 
 
-@router.post('/api/v1/sandbox/batches')
+@router.post('/api/v1/sandbox/batches', status_code=202)
 def sandbox_batch(request: BatchRequest, service: SandboxService = Depends(get_service), store: SnapshotStore = Depends(get_snapshot_store)):
-    from .batch import run_batch
+    """Start a batch in the background and return at once; poll GET /api/v1/sandbox/batches/{id}.
+
+    The request is validated first (unknown or duplicate fix: 422). Only one batch runs at
+    a time per service (409). Start and finish are recorded in the run history.
+    """
+    from .batch import plan_batch, execute_batch
+    from . import batch_jobs
+    from .shared import digest
+    batch_jobs.reconcile()
+    if batch_jobs.JOBS.busy():
+        raise HTTPException(409,'A batch is already running. Wait for its result.')
     try:
         requests=[prepare_uploaded(store,service,r) for r in request.fixes]
-        result,data=run_batch(requests,service,request.requested_order)
-        if data:
-            bundles.put(result['run_id'],data)
-            result['review_bundle']={'status':'READY','url':f"/api/v1/sandbox/runs/{result['run_id']}/bundle"}
-        if result.get('schema_version')=='sandbox-batch-v1': history.record(requests[0],result,data)
-        return result
+        plan=plan_batch(requests,service,request.requested_order,request.fix_all)
     except (ContractError,ValueError) as exc: raise HTTPException(422,str(exc)) from exc
+    except psycopg2.Error as exc:
+        logger.warning("Sandbox registry lookup failed")
+        raise HTTPException(503, "Approved-template registry unavailable") from exc
+    engine,first=plan['engine'],plan['first']
+
+    def on_start(job):
+        history.record(first,{'run_id':job.id,'schema_version':'sandbox-batch-v1','status':'RUNNING',
+                              'snapshot_hash':digest(first.snapshot),'spec_set_hash':engine.spec_set_hash,
+                              'spec_hashes':engine.hashes,'policy_profile':engine.policy_pin,
+                              'requires_dba_review':True,'fixes':[],'progress':job.progress(),
+                              'owner':batch_jobs.owner()})
+
+    def on_finish(job,result,data):
+        if data:
+            bundles.put(job.id,data)
+            result['review_bundle']={'status':'READY','url':f"/api/v1/sandbox/runs/{job.id}/bundle"}
+        progress=job.progress()
+        progress['status']=result.get('status')
+        history.record(first,{**result,'progress':progress},data)
+        return result
+
+    batch_id=str(uuid.uuid4())
+    try:
+        job=batch_jobs.JOBS.start(len(plan['eligible']),
+                                  lambda progress: execute_batch(plan,service,progress=progress,run_id=batch_id),
+                                  on_start,on_finish,batch_id=batch_id)
+    except batch_jobs.BatchBusy:
+        raise HTTPException(409,'A batch is already running. Wait for its result.') from None
+    return {'batch_id':job.id,'run_id':job.id,'status':'RUNNING','total_fixes':len(plan['eligible']),
+            'not_eligible':[{'fix_id':(plan['profiles'].get(key) or {}).get('fix_id') or key,'reason':reason}
+                            for key,reason in plan['not_eligible'].items()],
+            'progress_url':f"/api/v1/sandbox/batches/{job.id}"}
+
+
+@router.get('/api/v1/sandbox/batches/{batch_id}')
+def sandbox_batch_status(batch_id: str):
+    """Progress of a batch, and its final result once it has finished."""
+    from . import batch_jobs
+    job=batch_jobs.JOBS.get(batch_id)
+    if job is not None:
+        return job.view()
+    batch_jobs.reconcile()
+    try: result=history.get(batch_id)['result']
+    except ContractError: raise HTTPException(404,'Batch not found') from None
+    if result.get('schema_version')!='sandbox-batch-v1' or 'progress' not in result:
+        raise HTTPException(404,'Batch not found')
+    return batch_jobs.stored_view(batch_id,result)
 
 
 @router.post('/api/v1/benchmarks/import')
@@ -367,6 +453,8 @@ def snapshot_runs(snapshot_id: str, benchmark_id: str = Query(default='cis-pg17-
         engine,snapshot,_=assess_uploaded(store,snapshot_id,benchmark_id)
         for summary in history.list_runs():
             item=history.get(summary['run_id'])
+            # A batch that is still running or was interrupted has no result to compare yet.
+            if item['result'].get('status') in ('RUNNING','INTERRUPTED'): continue
             if item['result']['snapshot_hash']==digest(snapshot) and item['result']['spec_set_hash']==engine.spec_set_hash:
                 return {'result':item['result']}
         return {'result':None}

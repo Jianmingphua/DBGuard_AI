@@ -149,9 +149,22 @@ class SettingRuntime:
         return {"verified": True}
 
 
+class _SingleAwareService(SandboxService):
+    """Knows whether a runtime is requested by a fix's own test (service.run) or by the
+    combined test: since 12 Nov the combined test runs first and single tests only after it."""
+    single = False
+
+    def run(self, request):
+        self.single = True
+        try:
+            return super().run(request)
+        finally:
+            self.single = False
+
+
 def run_batch(engine, source, tmp_path, monkeypatch, combined_start=None):
-    """run_batch over 3.1.20 + 3.1.25. Individual runs start from the source; the
-    combined runtime (the third) starts from ``combined_start`` when given."""
+    """run_batch over 3.1.20 + 3.1.25. A fix's own test starts from the source; the
+    combined runtimes start from ``combined_start`` when given."""
     monkeypatch.setenv("DBGUARD_HISTORY_DIR", str(tmp_path))
     monkeypatch.setattr(SpecEngine, "collect", lambda self, runtime: copy.deepcopy(runtime.snapshot))
     by_setting = {s["check"]["setting_name"]: s["spec_id"] for s in engine.specs
@@ -159,7 +172,7 @@ def run_batch(engine, source, tmp_path, monkeypatch, combined_start=None):
     runtimes = []
 
     def factory():
-        start = combined_start if (combined_start is not None and len(runtimes) == 2) else source
+        start = combined_start if (combined_start is not None and not service.single) else source
         runtimes.append(SettingRuntime(start, len(runtimes) + 1, by_setting))
         return runtimes[-1]
     template = demo_template()
@@ -167,7 +180,7 @@ def run_batch(engine, source, tmp_path, monkeypatch, combined_start=None):
                             evidence=[{"document_id": "doc-1", "version": "1", "sha256": "a" * 64}])
     approved = replace(template, approved_by="unit-reviewer", evidence=tuple(
         {**e.model_dump(), "approved_by": "unit-reviewer"} for e in ref.evidence))
-    service = SandboxService("unused", registry_loader=Mock(return_value=approved), runtime_factory=factory)
+    service = _SingleAwareService("unused", registry_loader=Mock(return_value=approved), runtime_factory=factory)
     base = build_handoff(engine, source, ref).model_dump()
     requests = [SandboxHandoff(**{**base, "control_id": c, "retry_mode": "repeat"})
                 for c in (CONTROL, S3125)]
@@ -346,12 +359,13 @@ class TestDefaultCatalogNeverBlocks:
         mutate(snapshot)
         output, runtimes = run_batch(engine, snapshot, tmp_path, monkeypatch, combined_start=sandbox)
         assert output["status"] == "VERIFIED", output.get("combined_test", {}).get("reason")
-        assert len(runtimes) == 3 and all(r.closed for r in runtimes)
+        # Combined first (12 Nov): one combined sandbox, no single test.
+        assert len(runtimes) == 1 and all(r.closed for r in runtimes) and output["individual_runs"] == []
 
     def test_batch_without_differences(self, engine, snapshot, tmp_path, monkeypatch):
         output, runtimes = run_batch(engine, snapshot, tmp_path, monkeypatch)
         assert output["status"] == "VERIFIED"
-        assert [r["status"] for r in output["individual_runs"]] == ["VERIFIED", "VERIFIED"]
+        assert output["individual_runs"] == [] and len(runtimes) == 1  # combined first (12 Nov)
         assert not CATALOG_IDS & set(output["sandbox_after_findings"])
 
     @pytest.mark.parametrize("mutate", [catalog_gap_unrecorded, add_source_only_catalog,
@@ -593,7 +607,7 @@ class TestCatalogCompared:
     def test_batch_combined_catalog_difference_is_refused(self, engine, snapshot, tmp_path, monkeypatch):
         sandbox = copy.deepcopy(snapshot)
         catalog_gap_unrecorded(snapshot)
-        # Individual runs start from the source too, so only the combined step differs.
+        # A fix's own test would start from the source, so only the combined test differs.
         output, _ = run_batch(engine, snapshot, tmp_path, monkeypatch, combined_start=sandbox)
         assert output["status"] == "FAILED"
         assert output["combined_test"]["reason"] == "Combined baseline reproduction differs"

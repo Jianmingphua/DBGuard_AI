@@ -301,10 +301,13 @@ def test_risk_review_reports_reload_for_real_context(engine, snapshot, spec_id, 
     assert POLICIES[name][1] == EXPECTED_RISK[name]
     assert review["operational_risk"] == EXPECTED_RISK[name]
     assert review["dba_review_required"] is True
-    # The same review flips to restart (and high risk) if evidence says postmaster.
+    assert review["downtime"] == "none"
+    # The same review flips to restart if evidence says postmaster. E2E Gate 1 decision 1
+    # (10 Nov): a restart is a separate downtime label and no longer raises the risk.
     row.update(context="postmaster")
     restart = risk_review(engine, snapshot, spec_id)
-    assert (restart["requires"], restart["operational_risk"]) == ("restart", "high")
+    assert (restart["requires"], restart["downtime"]) == ("restart", "restart")
+    assert restart["operational_risk"] == EXPECTED_RISK[name]
 
 
 def test_log_truncate_on_rotation_impact_warns_of_log_data_loss(engine, snapshot):

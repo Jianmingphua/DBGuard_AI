@@ -241,7 +241,8 @@ def test_combined_batch_of_three_object_fixes(source, monkeypatch, tmp_path):
     output, data = batch.run_batch(requests, service)
     combined = output['combined_test']
     assert output['status'] == 'VERIFIED', combined.get('reason') or combined.get('rollback_error')
-    assert [r['status'] for r in output['individual_runs']] == ['VERIFIED'] * 3
+    # Combined first (Melvin, 12 Nov): all three passed together, so none ran a test of its own.
+    assert output['individual_runs'] == []
     assert [r['fix_id'] for r in combined['rollback']] == list(reversed(output['recommended_order']))
     assert all(r['verified'] for r in combined['rollback'])
     # One stand-in with all three targets and their dependencies.
@@ -253,10 +254,10 @@ def test_combined_batch_of_three_object_fixes(source, monkeypatch, tmp_path):
         for fix_id in output['recommended_order']:
             config = json.loads(z.read(fix_id + '/fix.json'))
             assert config['kind'] == 'object' and config['prior'] != config['applied']
-    # Every container this batch created (three individual runs, one combined), by its own run ID.
+    # Every container this batch created (the one combined test), by its own run ID.
     owned = [runtime.run_id for runtime in created]
-    assert len(owned) == len(set(owned)) == 4 and owned[-1] == combined['run_id']
-    print('RUN_IDS batch containers (3 individual, then combined)', owned)
+    assert len(owned) == len(set(owned)) == 1 and owned[-1] == combined['run_id']
+    print('RUN_IDS batch containers (combined only)', owned)
     assert [run_id for run_id in owned if docker('ps', '-aq', '--filter', f'label={LABEL}={run_id}')] == []
 
 

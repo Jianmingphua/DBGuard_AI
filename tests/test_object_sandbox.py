@@ -608,12 +608,13 @@ class TestObjectBatch:
         output, data = batch.run_batch(requests, service)
         return output, data, runtimes, proposals
 
-    def test_three_object_fixes_alone_then_combined(self, engine, planted, monkeypatch, tmp_path):
+    def test_three_object_fixes_prepared_then_combined(self, engine, planted, monkeypatch, tmp_path):
+        # Melvin, 12 Nov: combined first. All three pass together, so none gets its own test.
         output, data, runtimes, proposals = self._run(engine, planted, monkeypatch, tmp_path)
         assert output["status"] == "VERIFIED", output.get("combined_test", {}).get("reason") or output
-        assert [r["status"] for r in output["individual_runs"]] == ["VERIFIED"] * 3
+        assert output["individual_runs"] == []
         combined = runtimes[-1]
-        assert len(runtimes) == 4 and all(r.closed for r in runtimes)
+        assert len(runtimes) == 1 and all(r.closed for r in runtimes)
         # One stand-in holding all three targets, each fix in its own transaction, reverse rollback.
         assert sum(s.startswith("BEGIN;\nCREATE ROLE") for s in combined.executed) == 1
         applied = [s for s in combined.executed if s.startswith("BEGIN;\nALTER ROLE")]
@@ -635,12 +636,12 @@ class TestObjectBatch:
             "verify.sh", "visual_evidence.py", "manifest.json", "README.txt"}
 
     def test_combined_rollback_mismatch_fails(self, engine, planted, monkeypatch, tmp_path):
-        output, data, runtimes, _ = self._run(engine, planted, monkeypatch, tmp_path, {4: "rollback"})
+        output, data, runtimes, _ = self._run(engine, planted, monkeypatch, tmp_path, {1: "rollback"})
         assert output["status"] == "FAILED" and data is None
         assert runtimes[-1].closed
 
     def test_combined_reproduce_failure(self, engine, planted, monkeypatch, tmp_path):
-        output, data, runtimes, _ = self._run(engine, planted, monkeypatch, tmp_path, {4: "reproduce"})
+        output, data, runtimes, _ = self._run(engine, planted, monkeypatch, tmp_path, {1: "reproduce"})
         assert output["status"] == "FAILED" and data is None
         assert "does not reproduce" in output["combined_test"]["reason"]
         assert runtimes[-1].closed
