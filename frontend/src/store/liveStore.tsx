@@ -67,6 +67,16 @@ type LiveState = {
     benchmark: string
     data: any
   } | null
+  // Client-impact warnings the DBA acknowledged ("<snapshot_id>:<fix_id>"), and client
+  // changes marked done on step 7 ("<run_id>:<fix_id>"). E2E Gate 1 decision 3.
+  clientAcks: string[]
+  clientDone: string[]
+  // The one-click run in progress (or just finished): live progress from the backend.
+  batchRun: {
+    snapshot_id: string
+    benchmark: string
+    progress: any
+  } | null
   benchmark: string
   environment: string
   templateVersion: number
@@ -98,6 +108,9 @@ const fresh = (): LiveState => ({
   result: null,
   resultRestored: false,
   batch: null,
+  batchRun: null,
+  clientAcks: [],
+  clientDone: [],
   benchmark: "cis-pg17-v1.1.0",
   environment: "test",
   templateVersion: 1,
@@ -173,6 +186,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
           result: null,
           resultRestored: false,
           batch: null,
+          batchRun: null,
           handoffId: "",
           verification: null,
           error: "The demo session changed. Load the current live demo again.",
@@ -265,6 +279,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
         result: null,
         resultRestored: false,
         batch: null,
+        batchRun: null,
         handoffId: "",
         verification: null,
         messages: [],
@@ -289,6 +304,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
         result: null,
         resultRestored: false,
         batch: null,
+        batchRun: null,
         handoffId: "",
         verification: null,
         messages: [],
@@ -318,6 +334,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       result: null,
       resultRestored: false,
       batch: null,
+      batchRun: null,
       handoffId: "",
       verification: null,
     })
@@ -494,6 +511,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       result: null,
       resultRestored: false,
       batch: null,
+      batchRun: null,
       handoffId: "",
       verification: null,
       messages: [],
