@@ -79,3 +79,13 @@ Fixes that can lock out **other systems** (TLS, ciphers, network addresses, conn
 - **Terminal pictures** need VHS, ttyd, ffmpeg and psql on the DBA's machine (otherwise rendered), and should be used on single-user machines only.
 - **Still manual:** pg_hba edits, turning TLS on, and installing add-ons.
 - **Account and permission fixes** are hand-picked; including them automatically is recorded in the Architecture Plan.
+
+---
+
+## Rulings (Melvin, 16 Nov 2026)
+"Yes, merge both": Gate 2 is approved and PR #48 is to be merged. All five recommendations are approved:
+1. The end-to-end work is approved for merge.
+2. Package pictures keep **terminal** as the default, with the README's warning for shared machines.
+3. The client-warning acknowledgement is enforced on the screen and by the package (`--ack-client-impact`); that is the design.
+4. The md5 → SCRAM warning is a HANDOVER follow-up.
+5. The known limits of the one-click test are accepted and listed in HANDOVER.
