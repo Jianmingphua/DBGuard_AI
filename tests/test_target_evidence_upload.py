@@ -166,14 +166,23 @@ def test_the_endpoints_store_and_return_the_upload(tmp_path, monkeypatch):
 
 def test_malformed_members_are_refused_not_a_server_error(tmp_path):
     # Security review finding 4.
-    deep = b"[" * 100000 + b"]" * 100000
-    members = te.read_members(made_zip(tmp_path, shot("after")))
-    members["queries-after.json"] = deep
-    manifest = json.loads(members["manifest.json"])
-    manifest["files"]["queries-after.json"] = hashlib.sha256(deep).hexdigest()
-    members["manifest.json"] = json.dumps(manifest).encode()
+    def with_queries(data, folder):
+        members = te.read_members(made_zip(folder, shot("after")))
+        members["queries-after.json"] = data
+        manifest = json.loads(members["manifest.json"])
+        manifest["files"]["queries-after.json"] = hashlib.sha256(data).hexdigest()
+        members["manifest.json"] = json.dumps(manifest).encode()
+        return rezip(members)
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
     with pytest.raises(ContractError, match="not valid JSON"):
-        te.check(rezip(members), RUN, RECORD)
+        te.check(with_queries(b'{"run_id": ', tmp_path / "a"), RUN, RECORD)
+    # Deep nesting is refused either way: some Pythons stop parsing it (not valid JSON), newer
+    # ones parse it into a list (not a JSON object). Never a server error.
+    deep = b"[" * 100000 + b"]" * 100000
+    with pytest.raises(ContractError, match="not valid JSON|not a JSON object"):
+        te.check(with_queries(deep, tmp_path / "b"), RUN, RECORD)
     raw = bytearray(rezip({"manifest.json": b"{}" * 50}))
     raw[raw.index(b"{}") + 10] ^= 0xFF  # damage stored data so the CRC check fails
     with pytest.raises(ContractError):
