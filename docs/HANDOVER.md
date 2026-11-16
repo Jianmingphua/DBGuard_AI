@@ -35,7 +35,7 @@ never writes SQL or approves anything.
 | Families done | F1, F2, F3, F4, F5, F6, F7 (see the ROADMAP status table) |
 | Task 2 screenshots | Done (PR #44): rendered and VHS real-terminal pictures of sandbox runs |
 | Architecture doc | Rewritten 11 Nov (PR #46) |
-| **E2E "fix everything"** | **In progress, NOT on `main`.** Branch `melvin/e2e-fix-all` (see §8) |
+| **E2E "fix everything"** | **Done (16 Nov), in the E2E PR from `melvin/e2e-fix-all`.** One-click run, one-command DBA package with terminal pictures on the real database, client-impact warnings, restart label. See §8.1 and `docs/gates/E2E-gate2.md` |
 | F8, F9 | Not started. Planned as guided manual steps with evidence |
 | Task 3 (other OSes) | Not started. Design idea only: one runtime interface for the sandbox |
 | Production readiness | Not production-ready. Approvals are DEMO-labelled (no real sign-in), the services are not locked to loopback, and policy storage is not persistent |
@@ -233,25 +233,28 @@ review it. A tool must never accept SQL, a DSN, a file path or an approval.
 
 ## 8. Where to continue
 
-### 8.1 Finish the E2E "fix everything" work (branch `melvin/e2e-fix-all`)
+### 8.1 The E2E "fix everything" work (done 16 Nov)
 
-**First, protect the work.** As of 12 Nov this branch exists only on Melvin's machine. It has 2 local
-commits, more uncommitted edits, and is behind `main`. It must be committed, rebased on `main` and pushed
-before handover, or it is lost.
+Rulings: `docs/gates/E2E-gate1.md` (10 Nov, plus the 12 Nov "combined first" ruling). Approval and test
+evidence: `docs/gates/E2E-gate2.md`.
 
-The rulings are in `docs/gates/E2E-gate1.md` (approved 10 Nov). Status as of 12 Nov:
-
-| Item | State |
+| Item | Where |
 | --- | --- |
-| One-click run: phase 1 (no restart) then phase 2 (restart, one joint restart), lowest risk first, failed fixes left out (PARTIAL), no 6-fix limit | Backend in progress (`batch.py`, `planning.py` `fix_phase`/`order_key`/`recommend_order`) |
-| Progress bar with plain step descriptions | UI in progress (`frontend/src/live/batchProgress.ts`) |
-| Dependencies mean "verify after the restart", not "apply after" | Built in `recommend_order` |
-| Decision 1: separate "Needs restart (brief downtime)" label; 3.1.3, 5.6, 3.2 → medium; 5.2 stays high | **Not built.** Remove the restart floor in `review_floor_and_llm` (`if result["requires"] == "restart": … "high"`), add the label, and set the reviewed levels |
-| Decision 2: one combined pack with `harden.sh status / apply-all / verify-all / rollback-all`; terminal screenshots on the real database; evidence upload | In progress (`package_assets.py`, `bundle_assets/package_runner.py`, `bundle_assets/terminal_evidence.py`) |
-| Decision 3: client-impact warnings, live counts, required checkbox, `CLIENT-ACTIONS.txt`, `--ack-client-impact` | Not started |
+| One-click run: every fix prepared without a sandbox, **combined test first** (phase 1 no-restart fixes lowest risk first, then restart fixes with one restart per restart round), single tests only to explain a failure, FAILED fixes left out (PARTIAL), no 6-fix limit, background job with plain progress, INTERRUPTED after a service restart | `services/sandbox_poc/batch.py`, `batch_jobs.py`, `service.py` `prepare`, `workflow.py`, `router.py`; UI `frontend/src/live/ReviewPanel.tsx`, `batchProgress.ts` |
+| One-command package: folders built from the combined records; `harden.sh status / apply-all / verify-all / rollback-all`; pauses for a restart after each restart fix and prints the exact next command; terminal pictures on the real database through a private temporary connection file, rendered fallback without the address; evidence zip | `review_bundle.py` (`build_combined_fix_files`), `package_assets.py`, `bundle_assets/package_runner.py`, `bundle_assets/terminal_evidence.py` |
+| Step 7: evidence-zip upload (consistent, not authenticated) and the server's reassessment of a fresh snapshot | `target_evidence.py`, `router.py`, `frontend/src/live/LiveUI.tsx` |
+| Client-impact warnings (6.9, 6.10, 5.2, 5.5, 5.6): counted from evidence, acknowledgement, `CLIENT-ACTIONS.txt`, `--ack-client-impact`, pending list on step 7 | `client_impact.py`, `ClientImpact.tsx`, `clientWarnings.ts` |
+| "Needs restart (brief downtime)" label; 3.1.3, 5.6, 3.2 now medium | `planning.py` |
+| Sandbox: writable in-memory `/var/log/postgresql` (3.1.4 + 3.1.3 together) | `runtime.py` |
 | Company custom rules | Design only: `docs/design/COMPANY_RULES.md` |
-| Live tests: a one-click run of 10 or more fixes including restart fixes and one deliberate failure; the package's apply-all → restart → verify-all → rollback-all on the **disposable demo source** only | Not done |
-| db-security-reviewer pass (terminal capture on the DBA's machine, the evidence upload, the new commands), demo check, Gate 2 | Not done |
+
+**Follow-ups left by Gate 2:**
+- The real database gets one restart per restart fix, because each restart fix's guard (its tested "before" state) expects the earlier restart fixes active. Teaching `_bundle_states` (batch.py) and the runner the "written, pending restart" state would allow a single restart, as the sandbox does.
+- md5 → SCRAM has no client warning yet: there is no automatic fix to attach it to (manual checklist item).
+- The combined test uses each fix's approved template only; alternatives are tried only in a single test after a failure.
+- When a restart fails and every restart fix passes alone, the whole restart group is left out.
+- Account and permission fixes are hand-picked; including them automatically (one confirmation, least disruptive fix per account) is recorded in the Architecture Plan.
+- The step 7 screen does not yet explain why some failed checks are not in the one-click run (manual, policy missing, guided steps); a one-line breakdown on the card was suggested.
 
 ### 8.2 After E2E (recommended order, with the reasons in the Architecture Plan)
 1. Real sign-in for approvals (replace the DEMO labels).
@@ -270,8 +273,8 @@ The rulings are in `docs/gates/E2E-gate1.md` (approved 10 Nov). Status as of 12 
 ## 9. Known gaps and gotchas
 
 - **`/api/v1/health` reports stale flags:** `assessment_enabled: false` and `twin_runner_enabled: false`.
-- **Screenshot defaults differ by branch.** On `main` the demo turns sandbox screenshots on in terminal
-  mode. On the E2E branch they are off by default (10 Nov ruling) and move to the DBA package.
+- **Screenshots:** since the E2E work the demo takes no sandbox screenshots by default (set
+  `DBGUARD_SCREENSHOTS=true` to turn them on); pictures are taken by the DBA package on the real database.
 - **Risk-level inconsistency:** 3.1.15 (`log_min_error_statement`) is *low*, while 3.1.25
   (`log_statement`) is *medium*, although both notes warn about sensitive statement text. This awaits a
   decision.

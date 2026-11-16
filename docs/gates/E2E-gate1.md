@@ -114,3 +114,11 @@ All three recommendations are approved:
 1. **Risk levels:** "Needs restart (brief downtime)" becomes its own label. The log collector, password checker and audit logger go to **medium**; network addresses stays **high**.
 2. **Package:** `apply-all`, `verify-all`, `rollback-all` and `status`, plus terminal screenshots on the real database and the evidence upload on step 7. This **replaces Task 2 Gate 1 ruling #6** (rendered pictures only on the DBA's machine).
 3. **Client-impact warnings:** with live counts, the required checkbox, `CLIENT-ACTIONS.txt` and `--ack-client-impact`.
+
+## Ruling (Melvin, 12 Nov 2026): combined first, single tests only when needed
+In the demo, the one-click run spent 186 s of 251 s testing each fix in its own copy, although the combined test already checks every fix right after it is applied and checks every undo. Approved change:
+- **The combined test runs first.** If it passes, the run is finished (about 65 s instead of 251 s for the demo's 10 fixes).
+- **A no-restart fix that fails in the combined test** (the per-step check names it) is then tested on its own, for its retry and its reason, left out, and the rest are tested together again.
+- **A restart that fails:** the restart fixes of that restart are tested one by one to find the culprit, instead of leaving them all out.
+- **Package folders:** each fix's folder in the package is built from the combined test's records, not from a single-fix test.
+- **Unchanged:** a fix is only packaged after the final combined test proves it works and is undone exactly, and rollback and cleanup failures stay hard failures.
