@@ -1,12 +1,10 @@
 # DBGuardAI handover
 
-_Written 12 Nov 2026 and updated on the last day, 16 Nov 2026, by Melvin Loo (sole engineer)._
-
 This document is for the next intern or engineer. Read these three, in this order:
 
 | # | Document | What it gives you |
 | --- | --- | --- |
-| 1 | **Architecture Plan** (claude.ai page, shared by Melvin) | Why each feature was designed the way it was, how fix risk levels are decided, why work is done in batches, and the recommended next steps. Plain language. |
+| 1 | **Architecture Plan** | Why each feature was designed the way it was, how fix risk levels are decided, why work is done in batches, and the recommended next steps. Plain language. |
 | 2 | **This handover** | How to run, test and change the app, where everything lives, the exact state of the work, and where to continue. |
 | 3 | [`ARCHITECTURE.md`](../ARCHITECTURE.md) | The technical reference: components, API, trust boundaries and diagrams. |
 
