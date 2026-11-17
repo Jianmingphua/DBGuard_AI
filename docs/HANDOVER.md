@@ -1,7 +1,6 @@
 # DBGuardAI handover
 
-_Written 12 Nov 2026 by Melvin Loo (sole engineer, internship ends 16 Nov 2026). Update the
-"State at handover" section on the last day._
+_Written 12 Nov 2026 and updated on the last day, 16 Nov 2026, by Melvin Loo (sole engineer)._
 
 This document is for the next intern or engineer. Read these three, in this order:
 
@@ -27,7 +26,7 @@ state. The DBA downloads a fingerprinted bundle and runs it on the real database
 a real target.** An AI agent (HERMES) explains and drives the workflow through 11 restricted tools, but
 never writes SQL or approves anything.
 
-## 2. State at handover (12 Nov 2026)
+## 2. State at handover (16 Nov 2026)
 
 | Area | State |
 | --- | --- |
@@ -35,7 +34,8 @@ never writes SQL or approves anything.
 | Families done | F1, F2, F3, F4, F5, F6, F7 (see the ROADMAP status table) |
 | Task 2 screenshots | Done (PR #44): rendered and VHS real-terminal pictures of sandbox runs |
 | Architecture doc | Rewritten 11 Nov (PR #46) |
-| **E2E "fix everything"** | **Done (16 Nov), in the E2E PR from `melvin/e2e-fix-all`.** One-click run, one-command DBA package with terminal pictures on the real database, client-impact warnings, restart label. See §8.1 and `docs/gates/E2E-gate2.md` |
+| **E2E "fix everything"** | **Done, merged 16 Nov (PR #48), Gate 2 approved.** One-click run, one-command DBA package with terminal pictures on the real database, client-impact warnings, "Needs restart" label. See §8.1 and `docs/gates/E2E-gate2.md` |
+| HERMES knowledge search in the demo | Fixed, merged 16 Nov (PR #45): the demo answers "no approved guidance" instead of a 404 |
 | F8, F9 | Not started. Planned as guided manual steps with evidence |
 | Task 3 (other OSes) | Not started. Design idea only: one runtime interface for the sandbox |
 | Production readiness | Not production-ready. Approvals are DEMO-labelled (no real sign-in), the services are not locked to loopback, and policy storage is not persistent |
@@ -126,7 +126,7 @@ Example: CIS 3.1.20, "log_connections must be on".
 | 1. Collect | The DBA runs the read-only collector, which prints JSON (schema 0.3.0). Secret-bearing settings are recorded only as "set, N characters". | `collector/collect.sql`, `collector/dbguard-collect.sh` | – |
 | 2. Upload | The snapshot is validated against the contract, hashed and stored immutably | `backend/app/services/snapshot_service.py`, `catalog/specs/contracts/snapshot-v0.3.0.json` | `POST /api/v1/snapshots` |
 | 3. Assess | The spec `3.1.20.yaml` is loaded and its operator compares `log_connections` with `on`. The result is FAIL, with evidence. Missing evidence gives NOT_COLLECTED, never PASS. | `catalog/specs/cis-pg17-v1.1.0/3.1.20.yaml`, `backend/app/services/spec_engine/assess.py`, `operators.py` | `GET /api/v1/snapshots/{id}/spec-assessment` |
-| 4. Plan | The fix comes from the allowlist: value `on`, risk medium, impact text, prerequisites. The risk is raised (never lowered) by the template, restart and AI advice. | `services/sandbox_poc/planning.py` (`POLICIES`, `risk_review`, `review_floor_and_llm`) | `GET /api/v1/snapshots/{id}/fix-plan` |
+| 4. Plan | The fix comes from the allowlist: value `on`, risk medium, impact text, prerequisites. The risk can be raised (never lowered) by an approved template and the AI advice; a restart is shown as its own "Needs restart (brief downtime)" label. | `services/sandbox_poc/planning.py` (`POLICIES`, `risk_review`, `review_floor_and_llm`) | `GET /api/v1/snapshots/{id}/fix-plan` |
 | 5. Handoff | The caller (UI or HERMES) pins the snapshot, template version and evidence IDs. No SQL, DSN or approval is accepted. | `services/sandbox_poc/handoff.py` | `POST /api/v1/sandbox/handoffs` |
 | 6. Rehearse | A container starts from the pinned PG17+pgaudit image, with no network and a read-only root. It rebuilds the setting from the snapshot, then: assess = FAIL, render and apply the approved template, assess = PASS with no regressions and the server healthy, roll back, assess = original. The container is then removed. | `services/sandbox_poc/workflow.py` (`RemediationLoop`), `runtime.py` (`DisposablePostgres`), `provenance.py`, `templates.py` | `POST /api/v1/sandbox/handoffs/{id}/run` |
 | 7. Record | The result (VERIFIED / NEEDS_REVIEW / FAILED) and its evidence go into local SQLite history | `services/sandbox_poc/history.py` | `GET /api/v1/history/{run_id}` |
@@ -137,7 +137,8 @@ Variants of step 4:
 - **Per-object fixes (F6):** `object_fixes.py` and `ObjectRemediationLoop` use a "stand-in copy" of
   only the object being fixed.
 - **Add-on and TLS fixes:** `catalog_fixes.py` covers 3.2 pgaudit, 5.6 passwordcheck and 6.10 ciphers.
-- **Several fixes together:** `batch.py` (`POST /api/v1/sandbox/batches`).
+- **Every failed check at once (one click):** `batch.py` (`POST /api/v1/sandbox/batches`, background job), then one
+  DBA package with `sh harden.sh apply-all` (see §8.1).
 - **Report-only account checks:** `spec_engine/catalog_checks.py`.
 
 ## 5. Repository map
@@ -159,7 +160,7 @@ Variants of step 4:
 | `frontend/` | React + Vite UI. `src/views/` holds the screens, `src/live/` the connected workflow, `server.mjs` the gateway |
 | `scripts/` | `demo.py`, `validate_specs.py`, `coverage_report.py`, `build_sandbox_image.py`, `parse_cis_workbook.py`, … |
 | `docs/gates/` | Every Gate 1 and Gate 2 record: the design reasoning and Melvin's rulings. Read the one for the area you touch |
-| `docs/design/` | Designs not yet built (company custom rules arrives with the E2E branch) |
+| `docs/design/` | Designs not yet built: company custom rules (`COMPANY_RULES.md`) |
 | `services/twin_runner/`, `services/rag/` | Older parts, still wired in. Candidates for retirement |
 | `.claude/agents/` | The subagent council (see §7) |
 
@@ -203,8 +204,9 @@ review it. A tool must never accept SQL, a DSN, a file path or an approval.
   Both are written to `docs/gates/<wave>-gate{1,2}.md`. The reasons for batching are in the Architecture
   Plan.
 - **The subagent council** (`.claude/agents/`): spec-author, benchmark-fidelity-reviewer,
-  engine-implementer, sandbox-runtime-engineer, evidence-capture-engineer, test-writer and
-  db-security-reviewer. **No agent both writes something and approves it.** Reviewers are read-only.
+  engine-implementer, sandbox-runtime-engineer, evidence-capture-engineer, test-writer,
+  db-security-reviewer and architecture-reviewer. **No agent both writes something and approves it.**
+  Reviewers are read-only.
 - **Recipe for a new fixable setting** (from `CLAUDE.md`):
   1. `spec-author` writes the spec and `validate_specs.py` passes.
   2. `benchmark-fidelity-reviewer` checks it against the CIS text.
@@ -311,4 +313,5 @@ evidence: `docs/gates/E2E-gate2.md`.
 | Bundle / instruction pack | The zip the DBA runs on the real database |
 | Gate 1 / Gate 2 | Plan approval / build approval for a wave, recorded in `docs/gates/` |
 | HERMES | The AI agent. MCP is the protocol for its 11 tools |
-| Restart floor | Today's rule that any restart-required fix is shown as high risk (to be replaced by Decision 1) |
+| Needs restart label | Shown next to a fix's risk when it only takes effect after a PostgreSQL restart (planned downtime). It no longer raises the risk (E2E Gate 1 decision 1) |
+| One-click run / package | Test every fixable failed check together, then hand the DBA one package (`sh harden.sh apply-all`) |
