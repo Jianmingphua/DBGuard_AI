@@ -137,3 +137,39 @@ export function fixAllSelection(
   const keep = selected.filter((key) => !settings.includes(key))
   return [...new Set([...ready, ...keep])]
 }
+
+export type PackageRow = {
+  // "Tested alone": the single test's status, or why there was none.
+  alone: string
+  inPackage: boolean
+}
+
+// Step 6, one row per fix. With "combined first" (12 Nov) a fix that passes the combined
+// test is never tested alone, so the package decision comes from the run's own per-fix
+// results (fixes[].status === "PASSED"), not from a single test. Older recorded runs
+// without `fixes` keep the old rule: passed alone and the combined test verified.
+export function packageRow(batch: any, fixId: string): PackageRow {
+  const runs: any[] = Array.isArray(batch?.individual_runs)
+    ? batch.individual_runs
+    : []
+  const run = runs.find(
+    (r: any) => (r?.fix_id ?? r?.fix_unit?.fix_id) === fixId,
+  )
+  const ranAlone = typeof run?.status === "string" ? run.status : null
+  const fixes: any[] | null = Array.isArray(batch?.fixes) ? batch.fixes : null
+  if (fixes) {
+    const entry = fixes.find((f: any) => f?.fix_id === fixId)
+    const packaged =
+      entry?.status === "PASSED" &&
+      (batch?.status === "VERIFIED" || batch?.status === "PARTIAL")
+    return {
+      alone: ranAlone ?? (packaged ? "Not needed: passed together" : "NOT RUN"),
+      inPackage: packaged,
+    }
+  }
+  return {
+    alone: ranAlone ?? "NOT RUN",
+    inPackage:
+      ranAlone === "VERIFIED" && batch?.combined_test?.status === "VERIFIED",
+  }
+}

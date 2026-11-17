@@ -127,3 +127,46 @@ test("fix all: ticks every setting fix, keeps the DBA's account fixes, never add
     "fix-4.3-role-y",
   ])
 })
+
+test("step 6: a fix that passed together is in the package even without a single test", async () => {
+  const { packageRow } = await import("../src/live/batchProgress.ts")
+  const batch = {
+    status: "PARTIAL",
+    individual_runs: [{ fix_unit: { fix_id: "fix-b" }, status: "FAILED" }],
+    fixes: [
+      { fix_id: "fix-a", status: "PASSED", stage: "combined" },
+      { fix_id: "fix-b", status: "FAILED", stage: "individual" },
+      { fix_id: "fix-c", status: "NOT_ELIGIBLE", stage: "planning" },
+    ],
+    combined_test: { status: "VERIFIED" },
+  }
+  assert.deepEqual(packageRow(batch, "fix-a"), {
+    alone: "Not needed: passed together",
+    inPackage: true,
+  })
+  assert.deepEqual(packageRow(batch, "fix-b"), {
+    alone: "FAILED",
+    inPackage: false,
+  })
+  assert.equal(packageRow(batch, "fix-c").inPackage, false)
+  assert.equal(
+    packageRow({ ...batch, status: "FAILED" }, "fix-a").inPackage,
+    false,
+  )
+})
+
+test("step 6: older recorded runs without per-fix results keep the old rule", async () => {
+  const { packageRow } = await import("../src/live/batchProgress.ts")
+  const old = {
+    individual_runs: [{ fix_id: "fix-a", status: "VERIFIED" }],
+    combined_test: { status: "VERIFIED" },
+  }
+  assert.deepEqual(packageRow(old, "fix-a"), {
+    alone: "VERIFIED",
+    inPackage: true,
+  })
+  assert.deepEqual(packageRow(old, "fix-z"), {
+    alone: "NOT RUN",
+    inPackage: false,
+  })
+})

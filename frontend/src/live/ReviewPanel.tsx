@@ -15,6 +15,7 @@ import {
   fixAllSelection,
   formatDuration,
   groupFixes,
+  packageRow,
   outcomeSentence,
   progressLines,
   progressPercent,
@@ -803,7 +804,6 @@ export function CombinedReview() {
   const units: any[] =
     batch.fix_units ?? runs.map((r) => r.fix_unit).filter(Boolean)
   const order: string[] = batch.recommended_order ?? units.map((u) => u.fix_id)
-  const combinedOk = batch.combined_test?.status === "VERIFIED"
   const after = batch.sandbox_after_findings ?? {}
   // Object fixes: the title from their risk review (server-derived text).
   const reviews: any[] = Array.isArray(batch.risk_reviews)
@@ -812,9 +812,13 @@ export function CombinedReview() {
   const rows = order
     .map((fid) => units.find((u) => u.fix_id === fid))
     .filter(Boolean)
-  const untested = runs
-    .map(fixIdOf)
-    .filter((fid) => fid && !rows.some((u: any) => u.fix_id === fid))
+  // The run's own per-fix results name what was left out; older runs fall back to
+  // single tests that never reached the combined test.
+  const leftOut: string[] = Array.isArray(batch.fixes)
+    ? groupFixes(batch).failed.map((f) => f.fix_id)
+    : runs
+        .map(fixIdOf)
+        .filter((fid) => fid && !rows.some((u: any) => u.fix_id === fid))
   const titles = titlesBySpec(findings(s.assessment))
   return (
     <Card
@@ -846,9 +850,7 @@ export function CombinedReview() {
           </thead>
           <tbody>
             {rows.map((u: any, i: number) => {
-              const alone =
-                runs.find((r) => fixIdOf(r) === u.fix_id)?.status ?? "NOT RUN"
-              const ok = alone === "VERIFIED" && combinedOk
+              const { alone, inPackage: ok } = packageRow(batch, u.fix_id)
               const object = isObjectUnit(u)
               const catalog = !object && isCatalogUnit(u)
               const review = reviews.find((r) => r?.fix_id === u.fix_id)
@@ -910,9 +912,9 @@ export function CombinedReview() {
           </tbody>
         </table>
       </div>
-      {untested.length > 0 && (
+      {leftOut.length > 0 && (
         <p className="text-amber-800">
-          Stopped before the combined test: {untested.join(", ")}
+          Left out of the package (FAILED): {leftOut.join(", ")}
         </p>
       )}
       <p className="text-xs text-slate-500">
