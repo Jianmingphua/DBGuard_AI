@@ -113,7 +113,7 @@ test("bundle state: a run that did not verify says so; combined wording differs"
   )
   assert.equal(
     bundleState({ status: "FAILED" }, true).message,
-    "No combined bundle: every fix must pass alone and together first.",
+    "No combined bundle: no fix passed the combined test.",
   )
 })
 

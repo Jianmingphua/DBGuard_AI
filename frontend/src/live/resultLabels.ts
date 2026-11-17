@@ -117,7 +117,7 @@ export function bundleState(item: any, combined = false): BundleState {
   if (!ready) {
     if (item?.status !== "VERIFIED")
       message = combined
-        ? "No combined bundle: every fix must pass alone and together first."
+        ? "No combined bundle: no fix passed the combined test."
         : "No bundle: this test did not pass."
     else if (str(bundle?.reason)) message = `No bundle: ${clip(bundle.reason)}`
   }
