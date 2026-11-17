@@ -258,6 +258,7 @@ evidence: `docs/gates/E2E-gate2.md`.
 
 **Follow-ups left by Gate 2:**
 - The real database gets one restart per restart fix, because each restart fix's guard (its tested "before" state) expects the earlier restart fixes active. Teaching `_bundle_states` (batch.py) and the runner the "written, pending restart" state would allow a single restart, as the sandbox does.
+- **Preparing fixes is slow when the AI risk reviewer is on:** in the final demo run (17 Nov) preparing 10 fixes took about 4 minutes (10 to 60 s each, some hitting the 60 s model timeout), while the combined test itself took about 40 s. Preparation calls the reviewer once per fix, one after another; calling it in parallel, or only on request, would cut the run to about a minute.
 - md5 → SCRAM has no client warning yet: there is no automatic fix to attach it to (manual checklist item).
 - The combined test uses each fix's approved template only; alternatives are tried only in a single test after a failure.
 - When a restart fails and every restart fix passes alone, the whole restart group is left out.
