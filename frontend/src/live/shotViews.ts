@@ -71,3 +71,25 @@ export function shotsOf(evidence: any): ShotView[] | null {
     }
   })
 }
+
+// The step 7 upload receipt (target_evidence.check) in the shape shotsOf reads, so the
+// real-database pictures use the same strip and the same checks as sandbox pictures.
+export function targetEvidenceShots(receipt: any): any {
+  const stages = receipt?.stages
+  if (!stages || typeof stages !== "object") return null
+  const out: Record<string, any> = {}
+  for (const [stage] of STAGES) {
+    const s = stages[stage]
+    if (!s || typeof s !== "object") continue
+    out[stage] = {
+      status: s.png_base64 ? "CAPTURED" : "UNAVAILABLE",
+      mode: s.mode,
+      format: "png",
+      sha256: s.png_sha256,
+      png_base64: s.png_base64,
+      typed_command: s.typed_command,
+      reason: s.reason,
+    }
+  }
+  return { stages: out }
+}

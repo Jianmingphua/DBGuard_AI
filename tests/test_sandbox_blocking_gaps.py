@@ -86,8 +86,22 @@ class ApplyMutatingSettingRuntime(SettingRuntime):
         return out
 
 
+class _SingleAwareService(SandboxService):
+    """Knows whether a runtime is requested by a fix's own test (service.run) or by the
+    combined test: since 12 Nov the combined test runs first and single tests only after it."""
+    single = False
+
+    def run(self, request):
+        self.single = True
+        try:
+            return super().run(request)
+        finally:
+            self.single = False
+
+
 def run_batch(engine, source, tmp_path, monkeypatch, combined_mutate=None):
-    """run_batch over 3.1.20 + 3.1.25; only the combined (third) runtime is mutated on apply."""
+    """run_batch over 3.1.20 + 3.1.25; only the combined runtimes (never a fix's own test)
+    are mutated on apply."""
     monkeypatch.setenv("DBGUARD_HISTORY_DIR", str(tmp_path))
     monkeypatch.setattr(SpecEngine, "collect", lambda self, runtime: copy.deepcopy(runtime.snapshot))
     by_setting = {s["check"]["setting_name"]: s["spec_id"] for s in engine.specs
@@ -97,7 +111,7 @@ def run_batch(engine, source, tmp_path, monkeypatch, combined_mutate=None):
     def factory():
         n = len(runtimes) + 1
         rt = (ApplyMutatingSettingRuntime(source, n, by_setting, combined_mutate)
-              if combined_mutate and n == 3 else SettingRuntime(source, n, by_setting))
+              if combined_mutate and not service.single else SettingRuntime(source, n, by_setting))
         runtimes.append(rt)
         return rt
     template = demo_template()
@@ -105,7 +119,7 @@ def run_batch(engine, source, tmp_path, monkeypatch, combined_mutate=None):
                             evidence=[{"document_id": "doc-1", "version": "1", "sha256": "a" * 64}])
     approved = replace(template, approved_by="unit-reviewer", evidence=tuple(
         {**e.model_dump(), "approved_by": "unit-reviewer"} for e in ref.evidence))
-    service = SandboxService("unused", registry_loader=Mock(return_value=approved), runtime_factory=factory)
+    service = _SingleAwareService("unused", registry_loader=Mock(return_value=approved), runtime_factory=factory)
     base = build_handoff(engine, source, ref).model_dump()
     requests = [SandboxHandoff(**{**base, "control_id": c, "retry_mode": "repeat"}) for c in (CONTROL, S3125)]
     output, _ = batch.run_batch(requests, service)
@@ -198,9 +212,12 @@ class TestDefaultStillBlocks:
     @pytest.mark.parametrize("sections", BLOCKING_CASES)
     def test_batch_combined(self, engine, snapshot, tmp_path, monkeypatch, sections):
         output, runtimes = run_batch(engine, snapshot, tmp_path, monkeypatch, combined_mutate=add_gaps(*sections))
-        assert [r["status"] for r in output["individual_runs"]] == ["VERIFIED", "VERIFIED"]
+        # Combined first (12 Nov): the gap also leaves the undo unproven, a hard failure, so no
+        # fix gets a test of its own and nothing is retried.
+        assert output["individual_runs"] == [] and len(runtimes) == 1
         assert output["status"] == "FAILED"
         assert output["combined_test"]["reason"] == "Combined target, regression or functional gate failed"
+        assert output["combined_test"]["rollback_error"] == "Combined exact rollback failed"
         assert all(r.closed for r in runtimes)
 
     @pytest.mark.parametrize("sections", BLOCKING_CASES)

@@ -207,7 +207,9 @@ def test_combined_test_produces_three_terminal_pictures(terminal_mode, source, m
     combined = output["combined_test"]
     assert output["status"] == "VERIFIED", combined.get("reason") or combined.get("rollback_error")
     assert all(r["verified"] for r in combined["rollback"]) and combined["cleanup"]["verified"]
-    assert len(recorder.created) == 3 and recorder.created[-1].run_id == combined["run_id"]
+    # Combined first (Melvin, 12 Nov): one sandbox, no single test.
+    assert len(recorder.created) == 1 and recorder.created[-1].run_id == combined["run_id"]
+    assert output["individual_runs"] == []
     stages = assert_terminal_stages(combined["terminal_evidence"], combined["run_id"], "combined")
     save("combined-objects", stages)
     # One picture per stage for the whole batch, showing both objects.
@@ -221,11 +223,12 @@ def test_combined_test_produces_three_terminal_pictures(terminal_mode, source, m
     for stage in STAGES:
         name = f"screenshots/combined-{stage}.png"
         assert hashlib.sha256(files[name]).hexdigest() == manifest["files"][name] == stages[stage]["sha256"]
-    for run in output["individual_runs"]:
-        fix_manifest = json.loads(files[run["fix_id"] + "/manifest.json"])
-        for stage in STAGES:
-            member = f"screenshots/{stage}.png"
-            assert hashlib.sha256(files[run["fix_id"] + "/" + member]).hexdigest() == fix_manifest["files"][member]
+    # Fix folders are built from the combined records: the three pictures are the combined
+    # ones above; no folder has pictures of its own, and each folder manifest still holds.
+    for fix_id in output["recommended_order"]:
+        fix_manifest = json.loads(files[fix_id + "/manifest.json"])
+        assert not any(n.startswith(fix_id + "/screenshots/") for n in files)
+        assert all(hashlib.sha256(files[fix_id + "/" + n]).hexdigest() == h for n, h in fix_manifest["files"].items())
 
 
 # ---------------------------------------------------------------------------

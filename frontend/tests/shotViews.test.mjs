@@ -80,3 +80,35 @@ test("shots: no evidence means no strip; bad fingerprints are dropped", () => {
   })
   assert.equal(s.sha256, null)
 })
+
+test("target evidence: the upload receipt shows in the same strip, refusing bad picture data", async () => {
+  const { targetEvidenceShots, shotsOf } = await import(
+    "../src/live/shotViews.ts"
+  )
+  const sha = "a".repeat(64)
+  const shots = shotsOf(
+    targetEvidenceShots({
+      stages: {
+        before: {
+          mode: "terminal",
+          png_base64: "iVBORw0KGgo=",
+          png_sha256: sha,
+          typed_command: "psql service=dbguard -X",
+        },
+        after: { mode: "rendered", png_base64: "not base64!", png_sha256: sha },
+        rollback: {
+          mode: "off",
+          png_base64: null,
+          reason: "VHS is not installed",
+        },
+      },
+    }),
+  )
+  assert.equal(shots[0].captured, true)
+  assert.equal(shots[0].kind, "Terminal")
+  assert.equal(shots[0].typedCommand, "psql service=dbguard -X")
+  assert.equal(shots[1].captured, false)
+  assert.equal(shots[2].captured, false)
+  assert.equal(shots[2].reason, "VHS is not installed")
+  assert.equal(targetEvidenceShots(null), null)
+})

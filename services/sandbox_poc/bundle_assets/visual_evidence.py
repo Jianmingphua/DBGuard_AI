@@ -12,6 +12,22 @@ import json
 import subprocess
 import sys
 
+# Connection details are never pictured, whatever the caller passes (E2E gate 1, decision 2).
+CONNECTION_KEYS = frozenset({
+    "server_address", "server_port", "inet_server_addr", "inet_server_port", "host", "hostaddr",
+    "port", "password", "dsn",
+})
+
+
+def without_connection_details(value):
+    """The value with every connection-detail key removed, at any depth."""
+    if isinstance(value, dict):
+        return {k: without_connection_details(v) for k, v in value.items()
+                if str(k).lower() not in CONNECTION_KEYS}
+    if isinstance(value, list):
+        return [without_connection_details(v) for v in value]
+    return value
+
 
 def render_html(evidence):
     body = "".join(
@@ -38,8 +54,9 @@ def render_html(evidence):
             else str(value)
         )
         + "</dd>"
-        for key, value in evidence.items()
-        if key not in ("queries", "scope")
+        for key, value in without_connection_details(
+            {k: v for k, v in evidence.items() if k not in ("queries", "scope")}
+        ).items()
     )
     return (
         '<!doctype html><html><head><meta charset="utf-8"><style>body{font:16px system-ui;padding:32px;color:#152f36;background:#fff}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#edf4f3;padding:16px;font:14px monospace}section{border-top:1px solid #aaa;margin-top:24px}p,dd{overflow-wrap:anywhere}dl{display:grid;grid-template-columns:170px 1fr;gap:8px}dt{font-weight:600}dd{margin:0}</style></head><body><h1>DBGuardAI · Actual database query results</h1><p>'

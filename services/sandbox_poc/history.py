@@ -74,6 +74,25 @@ def list_runs():
         ]
 
 
+def running_batches():
+    """(run_id, result) of every recorded batch still marked RUNNING."""
+    with db() as c:
+        rows = c.execute("SELECT run_id,result FROM runs WHERE result LIKE ?",
+                         ('%"status": "RUNNING"%',)).fetchall()
+    found = []
+    for row in rows:
+        result = json.loads(row["result"])
+        if result.get("status") == "RUNNING" and result.get("schema_version") == "sandbox-batch-v1":
+            found.append((row["run_id"], result))
+    return found
+
+
+def update_result(run_id, result):
+    """Replace a recorded result, keeping its handoff, bundle, events and start time."""
+    with db() as c:
+        c.execute("UPDATE runs SET result=? WHERE run_id=?", (json.dumps(result), run_id))
+
+
 def bundle(run_id):
     with db() as c:
         row = c.execute("SELECT bundle FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -179,7 +198,8 @@ def _applied_snapshot(result):
         return None
     combined = result.get("combined_test") or {}
     steps = combined.get("steps") or []
-    if result.get("status") == "VERIFIED" and combined.get("status") == "VERIFIED" and steps:
+    # PARTIAL (10 Nov): the fixes proven together; fix_units lists only those.
+    if result.get("status") in ("VERIFIED", "PARTIAL") and combined.get("status") == "VERIFIED" and steps:
         return steps[-1].get("after")
     return None
 

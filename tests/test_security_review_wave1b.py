@@ -297,13 +297,23 @@ def test_batch_output_readme_and_report_carry_the_label(monkeypatch, fixture):
     def fake_bundle(handoff, result, engine):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("fix.json", json.dumps({"policy_profile": engine.policy_pin}))
+            # Real per-fix bundles always carry the database name; the combined package needs it.
+            archive.writestr("fix.json", json.dumps({"policy_profile": engine.policy_pin, "database": "appdb"}))
             archive.writestr("manifest.json", json.dumps({"files": {}}))
         return buffer.getvalue()
 
+    def fake_folder(handoff, prepared, step, record, engine, **kwargs):
+        # build_combined_fix_files (12 Nov: folders from the combined records) writes the same pin.
+        return {"fix.json": json.dumps({"policy_profile": engine.policy_pin, "database": "appdb",
+                                        "combined_run_id": kwargs["package_run_id"]}).encode(),
+                "manifest.json": json.dumps({"files": {}}).encode()}
+
+    # Combined first (12 Nov): fixes are prepared without a sandbox (same fields, no attempts).
     service = SimpleNamespace(validate_handoff=lambda request: fake_engine, run=result_for,
+                              prepare=lambda request: {**result_for(request), "status": "PREPARED"},
                               runtime_factory=_BatchRuntime)
     monkeypatch.setattr(batch_module, "build_review_bundle", fake_bundle)
+    monkeypatch.setattr(batch_module, "build_combined_fix_files", fake_folder)
     monkeypatch.setattr(batch_module, "is_fixture", lambda result: fixture)
     monkeypatch.setattr(batch_module.history, "record", lambda *args: None)
     monkeypatch.setattr(batch_module, "reconstruction_plan", lambda snap, specs: {"names": [], "signature": {"settings": {}}})

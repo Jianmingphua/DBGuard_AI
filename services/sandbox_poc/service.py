@@ -1,15 +1,17 @@
 """Connect an upstream handoff to approved registry content and the test loop."""
+import copy
 import json
 import uuid
 
 from jsonschema import Draft202012Validator, ValidationError
 
+from app.services.fix_unit_render import render_action_script
 from app.services.spec_engine import RecordsIndex, RecordsIntegrityError
 
 from .handoff import SandboxHandoff
 from .provenance import reconstruction_plan
 from .runtime import DisposablePostgres
-from .shared import ContractError, ROOT, SpecEngine
+from .shared import ContractError, ROOT, SpecEngine, digest
 from .templates import from_registry
 from .workflow import CONTROL, RemediationLoop
 from .planning import fix_scope, risk_review, session_override_reason
@@ -111,6 +113,69 @@ class SandboxService:
             [entry.document_id for entry in ref.evidence], ref.environment,
             evidence_pins=[entry.model_dump() for entry in ref.evidence],
             **({"registry_name":ref.registry_name} if ref.registry_name != "set_config_parameter" else {}))
+
+    def prepare(self, request: SandboxHandoff) -> dict:
+        """Everything run() checks and builds before it starts a sandbox, without one.
+
+        Batches (Melvin, 12 Nov: combined test first) use this instead of a single-fix run:
+        the same handoff validation (spec and policy hashes, snapshot binding, the control's
+        FAIL, gaps), the approved, hash-pinned templates from the registry, the fix unit and
+        its SQL rendered from those templates only, and the risk review. No container is
+        created. The result has the fields of a run result the combined test and the
+        package need, with status PREPARED and no attempts.
+        """
+        engine = self.validate_handoff(request)
+        if request.retry_mode == 'adaptive' and self.reviser is None:
+            raise ContractError('Adaptive retries require the sandbox LLM reviewer to be configured')
+        snapshot = copy.deepcopy(request.snapshot)
+        common = {"schema_version": "sandbox-prepared-v1", "status": "PREPARED",
+                  "snapshot_hash": digest(snapshot), "spec_set_hash": engine.spec_set_hash,
+                  "spec_hashes": engine.hashes, "collector_hash": engine.collector_hash,
+                  "policy_profile": engine.policy_pin, "approval_source": "registry",
+                  "requires_dba_review": True, "handoff_version": request.schema_version}
+        if request.object_fix_id is not None:
+            from .workflow import ObjectRemediationLoop, object_risk_review
+            from . import catalog_skeleton
+            proposal = self.object_proposal(engine, request)
+            template = self.resolve_template(request)
+            bound = ObjectRemediationLoop(engine, template, proposal).prepare(snapshot, request.assessment)
+            fix = bound["fix"]
+            return {**common, "kind": "object", "template": template.identity(),
+                    "proposal": copy.deepcopy(proposal), "fix_unit": fix, "fix_unit_hash": digest(fix),
+                    "source_object_signature": bound["source_signature"],
+                    "skeleton": catalog_skeleton.summary(bound["skeleton"]),
+                    "rendered_apply_sql": "\n".join(bound["apply"]),
+                    "rendered_rollback_sql": "\n".join(bound["rollback"]),
+                    "risk_review": object_risk_review(proposal, template.risk_level)}
+        from .catalog_fixes import CatalogFixLoop, catalog_risk_review, is_catalog_fix, rollback_sql
+        if is_catalog_fix(engine, request.control_id):
+            template = self.resolve_template(request)
+            list_template = (self.resolve_template(request, request.list_template_ref)
+                             if request.list_template_ref is not None else None)
+            risks = {"low": 0, "medium": 1, "high": 2, "not_assessed": 3}
+            template_risk = max((t.risk_level for t in (template, list_template) if t and t.risk_level in risks),
+                                key=risks.get, default=None)
+            review = catalog_risk_review(engine, snapshot, request.control_id, self.risk_reviewer, template_risk)
+            bound = CatalogFixLoop(engine, template, control_id=request.control_id,
+                                   list_template=list_template).prepare(snapshot, request.assessment)
+            fix = bound["fix"]
+            return {**common, "kind": "catalog_setting", "template": template.identity(),
+                    **({"list_template": list_template.identity()} if "list_template_id" in fix else {}),
+                    "fix_unit": fix, "fix_unit_hash": digest(fix), "names": bound["names"],
+                    "rendered_apply_statements": list(bound["rendered"]),
+                    "rendered_apply_sql": "\n".join(bound["rendered"]), "rendered_rollback_sql": rollback_sql(fix),
+                    "risk_review": review}
+        template = self.resolve_template(request)
+        if request.retry_mode == 'adaptive':
+            # Resolved (pins re-checked) as run() does; a single test may use them later.
+            for ref in request.retry_template_refs:
+                self.resolve_template(request, ref)
+        review = risk_review(engine, snapshot, request.control_id, self.risk_reviewer, template.risk_level)
+        bound = RemediationLoop(engine, template, control_id=request.control_id).prepare(snapshot, request.assessment)
+        fix = bound["fix"]
+        return {**common, "template": template.identity(), "fix_unit": fix, "fix_unit_hash": digest(fix),
+                "rendered_apply_sql": bound["rendered"], "rendered_rollback_sql": render_action_script(fix["rollback"]),
+                "risk_review": review}
 
     def run(self, request: SandboxHandoff) -> dict:
         # Validate before opening the registry or allocating any Docker resource.

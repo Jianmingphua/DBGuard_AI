@@ -1,5 +1,8 @@
 import { FileButton } from "./FileButton"
 import { EvidenceShots } from "./EvidenceShots"
+import { targetEvidenceShots } from "./shotViews"
+import { pendingClientActions } from "./clientWarnings"
+import { WarningText } from "./ClientImpact"
 import { BenchmarkImport } from "./BenchmarkImport"
 import {
   CombinedResult,
@@ -1189,6 +1192,136 @@ export function RunResult({ framed = true }: { framed?: boolean }) {
   )
 }
 
+// Step 7: the evidence the DBA's package recorded on the real database. The zip is
+// checked by the server (fingerprints, run, database and cluster identity) before the
+// pictures are shown; a passing check never claims the database is hardened.
+function PackageEvidence({ runId }: { runId: string | null }) {
+  const live = useLive()
+  const s = live.state
+  const [receipt, setReceipt] = useState<any>(null)
+  useEffect(() => setReceipt(null), [runId])
+  if (!runId) return null
+  const path = `/bridge/${s.service}/api/v1/history/${encodeURIComponent(runId)}/target-evidence`
+  return (
+    <section className="rounded-lg border border-slate-200 p-4 space-y-2">
+      <h3 className="font-semibold">Evidence from the DBA's package</h3>
+      <p className="text-sm text-slate-600">
+        After running the package on the real database, the DBA has a file named{" "}
+        <code>target-evidence-{runId}.zip</code> in the package's{" "}
+        <code>target-evidence</code> folder. Upload it here to see the before,
+        after and undo pictures taken on the real database.
+      </p>
+      <FileButton
+        label="Upload the package's evidence (.zip)"
+        aria-label="Target evidence zip"
+        accept=".zip"
+        disabled={!!s.busy}
+        onChange={(e) => {
+          const f = e.target.files?.[0]
+          if (f)
+            void live.action("Checking the package's evidence", async () => {
+              setReceipt(null)
+              const body = new FormData()
+              body.append("file", f)
+              await request(path, { method: "POST", body })
+              setReceipt(await request(path))
+            })
+        }}
+      />
+      {receipt && (
+        <>
+          <p className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
+            The files are consistent and name this run and database{" "}
+            <strong>{receipt.database}</strong>. They are not proof on their
+            own: they show what the DBA reports the package recorded. Only
+            DBGuard's check of a fresh snapshot below confirms the database is
+            hardened.
+          </p>
+          <EvidenceShots
+            evidence={targetEvidenceShots(receipt)}
+            title="Pictures taken on the real database"
+            note="Taken by the DBA's package: before applying, after applying (and after any restart), and after any undo. The recorded query output is the source of truth; the picture shows it."
+          />
+          <Fold
+            title="What the package recorded"
+            hint="Each command's result per fix, and the query output behind each picture."
+          >
+            <Raw
+              value={Object.fromEntries(
+                Object.entries(receipt.stages ?? {}).map(([k, v]: any) => [
+                  k,
+                  { ...v, png_base64: v?.png_base64 ? "(shown above)" : null },
+                ]),
+              )}
+              label="Package evidence"
+            />
+          </Fold>
+        </>
+      )}
+    </section>
+  )
+}
+// Step 7: client changes the package's fixes need. The server side can be hardened while
+// clients still use old settings, so each stays "pending" until the DBA marks it done
+// (E2E Gate 1, decision 3).
+function PendingClientChanges({ runId }: { runId: string | null }) {
+  const live = useLive()
+  const s = live.state
+  const items = pendingClientActions(
+    currentBatch(s),
+    currentBatch(s) ? null : s.result,
+    runId,
+  )
+  if (items.length === 0) return null
+  const pending = items.filter((i) => !s.clientDone.includes(i.key))
+  return (
+    <section
+      className={`rounded-lg border-2 p-4 space-y-3 ${
+        pending.length
+          ? "border-red-300 bg-red-50 text-red-950"
+          : "border-green-200 bg-green-50 text-green-900"
+      }`}
+    >
+      <h3 className="font-semibold">
+        {pending.length
+          ? `Client changes still pending: ${pending.length} of ${items.length}`
+          : "All client changes marked done"}
+      </h3>
+      <p className="text-sm">
+        These fixes harden the database, but clients that are not updated can be
+        locked out. Hardening your side does not update them. Mark each one done
+        only after the affected clients are updated and reconnect.
+      </p>
+      {items.map((item) => {
+        const done = s.clientDone.includes(item.key)
+        return (
+          <div
+            key={item.key}
+            className="rounded border border-red-200 bg-white p-3 space-y-2 text-sm"
+          >
+            <p className="font-semibold">{item.title}</p>
+            <WarningText warning={item.warning} />
+            <label className="flex gap-2 items-center font-medium">
+              <input
+                type="checkbox"
+                checked={done}
+                aria-label={`Client changes done for ${item.fixId}`}
+                onChange={(e) =>
+                  live.patch({
+                    clientDone: e.target.checked
+                      ? [...s.clientDone, item.key]
+                      : s.clientDone.filter((k) => k !== item.key),
+                  })
+                }
+              />
+              Client changes done and the affected clients reconnect
+            </label>
+          </div>
+        )
+      })}
+    </section>
+  )
+}
 function Verification() {
   const live = useLive()
   const s = live.state
@@ -1205,6 +1338,10 @@ function Verification() {
     ),
   ]
   const testedTitles = titlesBySpec(findings(s.assessment))
+  // The package being checked: the latest combined test, else the single-fix test.
+  const runId: string | null =
+    currentBatch(s)?.run_id ?? s.result?.run_id ?? null
+  const [confirmed, setConfirmed] = useState<any>(null)
   const matching =
     sameTarget(s.snapshot, snapshot) &&
     isFreshSnapshot(s.snapshot, snapshot) &&
@@ -1216,6 +1353,8 @@ function Verification() {
       title="Check the real database after the DBA's change"
       subtitle="DBGuard never changes your database itself. Once the DBA has run the bundle, collect fresh evidence and check it here: the fixed rules should now pass."
     >
+      <PackageEvidence runId={runId} />
+      <PendingClientChanges runId={runId} />
       {s.service === "demo" ? (
         <>
           <button
@@ -1299,6 +1438,23 @@ function Verification() {
                   ),
                 )
                 setAssessment(a)
+                setConfirmed(null)
+                // The server's own comparison against the recorded run (same
+                // database, cluster, rule set and policy), stored in run history.
+                if (runId)
+                  setConfirmed(
+                    await api(
+                      "main",
+                      `/api/v1/history/${encodeURIComponent(runId)}/reassess`,
+                      {
+                        snapshot_id: snapshot.snapshot_id,
+                        benchmark_id: s.benchmark,
+                      },
+                    ).catch((e: unknown) => ({
+                      status: "NOT_CONFIRMED",
+                      error: e instanceof Error ? e.message : String(e),
+                    })),
+                  )
                 live.patch({
                   verification: {
                     snapshot,
@@ -1316,6 +1472,21 @@ function Verification() {
           >
             2. Check it against the CIS rules
           </button>
+          {confirmed && (
+            <p
+              className={`rounded border px-3 py-2 text-sm ${
+                confirmed.status === "TARGET_REASSESSMENT_CONFIRMED"
+                  ? "border-green-200 bg-green-50 text-green-900"
+                  : "border-red-200 bg-red-50 text-red-900"
+              }`}
+            >
+              {confirmed.status === "TARGET_REASSESSMENT_CONFIRMED"
+                ? "Confirmed by DBGuard: every fix in this package now passes on the real database, with no rule made worse and no missing evidence. Recorded in the run history."
+                : confirmed.status === "TARGET_VERIFICATION_FAILED"
+                  ? "Not confirmed: at least one fix in this package does not pass on the real database yet, a rule got worse, or evidence is missing. See the comparison below."
+                  : `Not confirmed: ${confirmed.error ?? "DBGuard could not compare this snapshot with the recorded test."}`}
+            </p>
+          )}
           {assessment && (
             <>
               <p>

@@ -2,18 +2,24 @@ import { useState } from "react"
 import { shotsOf, type ShotView } from "./shotViews"
 
 // "Evidence screenshots": one thumbnail per stage; click to open full size.
-export function EvidenceShots({ evidence }: { evidence: any }) {
+type EvidenceShotsProps = {
+  evidence: any
+  title?: string
+  note?: string
+}
+export function EvidenceShots({ evidence, title, note }: EvidenceShotsProps) {
   const shots = shotsOf(evidence)
   const [open, setOpen] = useState<ShotView | null>(null)
   if (!shots) return null
   return (
     <section className="rounded-lg border border-slate-200 p-3 space-y-2">
       <div>
-        <p className="font-semibold text-sm">Evidence screenshots</p>
+        <p className="font-semibold text-sm">
+          {title ?? "Evidence screenshots"}
+        </p>
         <p className="text-xs text-slate-500">
-          Taken on the throwaway copy before the fix, after it, and after the
-          undo. The query results recorded with each picture are the source of
-          truth; the picture shows them.
+          {note ??
+            "Taken on the throwaway copy before the fix, after it, and after the undo. The query results recorded with each picture are the source of truth; the picture shows them."}
         </p>
       </div>
       <ul className="grid gap-3 sm:grid-cols-3">

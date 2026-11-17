@@ -168,7 +168,10 @@ class TestFixTypes:
             assert p["risk"] == of.FIX_TYPES[p["fix_type"]].risk
             assert p["rehearsable"] is True and "not_rehearsable_reason" not in p
             assert set(p) <= {"fix_id", "spec_id", "fix_type", "target", "params", "prior", "title",
-                              "explanation", "risk", "rehearsable", "not_rehearsable_reason", "note", "limit_source"}
+                              "explanation", "risk", "rehearsable", "not_rehearsable_reason", "note", "limit_source",
+                              # E2E Gate 1 decision 3: 5.5 limits carry the client-impact warning.
+                              "client_impact"}
+            assert ("client_impact" in p) == (p["fix_type"] == "role_connection_limit")
 
     def test_prior_is_the_exact_evidence_value(self, engine, snapshot):
         engine = with_policy(engine, profile({"default_login_limit": 20, "roles": {}}))

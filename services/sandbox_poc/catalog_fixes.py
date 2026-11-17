@@ -39,6 +39,7 @@ from app.services.spec_engine.redaction import is_redacted
 from app.services.spec_engine.sources import SERVER_WIDE_SOURCES
 
 from .planning import CATALOG_FIX_LINKS, CHECKS, POLICIES, grounding, review_floor_and_llm
+from . import client_impact
 from .provenance import FILES, reconstruct, reconstruction_plan, setting_rows
 from .runtime import DisposablePostgres, SandboxStartError
 from .shared import ROOT, ContractError, blocking_gaps, digest
@@ -511,6 +512,10 @@ def catalog_risk_review(engine, snapshot, control, reviewer=None, template_risk=
                             "A reload rereads configuration without restarting PostgreSQL; it applies to new connections."),
         "reference_urls": grounding(primary["param"])[1],
     }
+    # E2E Gate 1 decision 3: 6.10 ciphers and 5.6 passwordcheck can lock out clients or scripts.
+    impact = client_impact.for_catalog(snapshot, scope["evaluator"])
+    if impact:
+        result["client_impact"] = impact
     return review_floor_and_llm(result, primary["param"], reviewer, template_risk)
 
 

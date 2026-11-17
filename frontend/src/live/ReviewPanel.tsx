@@ -8,8 +8,19 @@ import { combinedResultTitle, titlesBySpec } from "./resultLabels"
 import { batchAfter, sameAssessment } from "./sandboxChanges"
 import { ObjectProposals } from "./ObjectProposals"
 import { EvidenceShots } from "./EvidenceShots"
+import { ClientImpactBox } from "./ClientImpact"
+import { cleared } from "./clientWarnings"
 import {
-  MAX_BATCH,
+  RUNNING,
+  fixAllSelection,
+  formatDuration,
+  groupFixes,
+  outcomeSentence,
+  progressLines,
+  progressPercent,
+  stepDescription,
+} from "./batchProgress"
+import {
   batchFixes,
   chooseListTemplate,
   isCatalogLinkedFix,
@@ -88,6 +99,80 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
       setPlan(p)
     })
   }
+  // E2E Gate 1 decision 3: a fix that can lock out clients is tested or packaged only
+  // after the DBA acknowledges its warning.
+  const fixCleared = (f: any) =>
+    cleared(f, s.clientAcks, s.snapshot?.snapshot_id, f?.fix_id)
+  const waitingForAck = (plan?.recommended_order ?? []).filter(
+    (f: any) => !fixCleared(f),
+  ).length
+  // Starts a combined test in the background, then follows its progress until it ends.
+  async function startBatch(keys: string[], ownOrder: boolean, fixAll = false) {
+    const snapshotId = s.snapshot.snapshot_id
+    const benchmark = s.benchmark
+    await live.action("Testing fixes on a throwaway copy", async () => {
+      live.patch({ batch: null, batchRun: null })
+      const started = await api(s.service, "/api/v1/sandbox/batches", {
+        // One-click run: conflicts become "not eligible" instead of refusing the
+        // request, and the server's two-phase order is always used.
+        fix_all: fixAll,
+        // Object fixes are ordered by their own fix_id.
+        requested_order: ownOrder
+          ? keys.map((sid) =>
+              isObjectFixId(sid)
+                ? sid
+                : plan.recommended_order.find((f: any) => f.spec_id === sid)
+                    .fix_id,
+            )
+          : null,
+        // Object fixes send only object_fix_id; never params.
+        fixes: batchFixes(
+          keys,
+          {
+            snapshot_id: snapshotId,
+            benchmark_id: benchmark,
+            environment: s.environment,
+            evidence_ids: s.evidenceIds
+              .split(",")
+              .map((v: string) => v.trim())
+              .filter(Boolean),
+            policy_profile: s.policyProfile?.profile_ref ?? null,
+          },
+          {
+            templateVersion: s.templateVersion,
+            retryMode: s.retryMode,
+          },
+          (fixId: string) =>
+            objectTemplateVersionFor(plan, fixId, s.objectTemplateVersion),
+          // Only preload fixes (3.2, 5.6) get list_template_version.
+          (controlId: string) => listTemplateVersionFor(plan, controlId),
+          // Catalog-linked fixes (3.2, 5.6, 6.10) run once: no retries.
+          (controlId: string) => isCatalogLinkedFix(plan, controlId),
+        ),
+      })
+      const id = encodeURIComponent(String(started?.batch_id ?? ""))
+      if (!id) throw new Error("The combined test did not start")
+      let view: any = { status: RUNNING, done: 0, total: started.total_fixes }
+      while (view?.status === RUNNING) {
+        live.patch({
+          batchRun: { snapshot_id: snapshotId, benchmark, progress: view },
+        })
+        await new Promise((r) => setTimeout(r, 2500))
+        view = await api(s.service, `/api/v1/sandbox/batches/${id}`)
+      }
+      live.patch({
+        batchRun: { snapshot_id: snapshotId, benchmark, progress: view },
+        batch: {
+          snapshot_id: snapshotId,
+          benchmark,
+          data: {
+            ...(view?.result ?? { status: view?.status }),
+            not_eligible: started.not_eligible ?? [],
+          },
+        },
+      })
+    })
+  }
   const proposalCount = groups.reduce(
     (n, g) => n + (g.proposals ?? []).length,
     0,
@@ -146,6 +231,14 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
                     >
                       {f.operational_risk} risk
                     </span>
+                    {(f.downtime ?? f.requires) === "restart" && (
+                      <span
+                        className="rounded px-2 py-0.5 text-xs bg-indigo-50 text-indigo-800"
+                        title="The change only takes effect after PostgreSQL restarts. Plan a short maintenance window. This is separate from the risk level."
+                      >
+                        Needs restart (brief downtime)
+                      </span>
+                    )}
                   </div>
                   {isCatalogSettingFix(f) ? (
                     <CatalogSettingChanges
@@ -172,6 +265,7 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
                       </ul>
                     </div>
                   )}
+                  <ClientImpactBox source={f} fixId={f.fix_id} />
                   <Fold
                     title="Undo and AI review"
                     hint="How the change is undone, where the current value comes from, and any AI comments."
@@ -211,7 +305,7 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
                     ) : (
                       <button
                         className={`${outline} text-sm`}
-                        disabled={!!s.busy || !!s.handoffId}
+                        disabled={!!s.busy || !!s.handoffId || !fixCleared(f)}
                         onClick={() =>
                           live.configure({
                             controlId: f.spec_id,
@@ -245,6 +339,9 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
                         }
                         type="checkbox"
                         checked={selected.includes(f.spec_id)}
+                        disabled={
+                          !fixCleared(f) && !selected.includes(f.spec_id)
+                        }
                         onChange={(e) => toggle(f.spec_id, e.target.checked)}
                       />
                       Add to the combined test
@@ -350,7 +447,7 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
             <h3 className="font-semibold">Test the ticked fixes together</h3>
             <p className="text-sm text-slate-500">
               Checks that the fixes still work when applied one after another on
-              the same copy. Tick 2 to {MAX_BATCH} fixes in section 1.
+              the same copy. Tick two or more fixes in section 1.
             </p>
             {!plan ? (
               <p className="text-sm">Show the recommended fixes first.</p>
@@ -398,84 +495,177 @@ export function FixPlan({ onOpenPolicy, singleTest }: FixPlanProps) {
             {plan && (
               <button
                 className={button}
-                disabled={
-                  !!s.busy || selected.length < 2 || selected.length > MAX_BATCH
-                }
-                onClick={() =>
-                  void live.action(
-                    "Testing fixes individually and together",
-                    async () => {
-                      live.patch({ batch: null })
-                      const b = await api(
-                        s.service,
-                        "/api/v1/sandbox/batches",
-                        {
-                          // Object fixes are ordered by their own fix_id.
-                          requested_order: customOrder
-                            ? selected.map((sid) =>
-                                isObjectFixId(sid)
-                                  ? sid
-                                  : plan.recommended_order.find(
-                                      (f: any) => f.spec_id === sid,
-                                    ).fix_id,
-                              )
-                            : null,
-                          // Object fixes send only object_fix_id; never params.
-                          fixes: batchFixes(
-                            selected,
-                            {
-                              snapshot_id: s.snapshot.snapshot_id,
-                              benchmark_id: s.benchmark,
-                              environment: s.environment,
-                              evidence_ids: s.evidenceIds
-                                .split(",")
-                                .map((v: string) => v.trim())
-                                .filter(Boolean),
-                              policy_profile:
-                                s.policyProfile?.profile_ref ?? null,
-                            },
-                            {
-                              templateVersion: s.templateVersion,
-                              retryMode: s.retryMode,
-                            },
-                            (fixId: string) =>
-                              objectTemplateVersionFor(
-                                plan,
-                                fixId,
-                                s.objectTemplateVersion,
-                              ),
-                            // Only preload fixes (3.2, 5.6) get list_template_version.
-                            (controlId: string) =>
-                              listTemplateVersionFor(plan, controlId),
-                            // Catalog-linked fixes (3.2, 5.6, 6.10) run once: no retries.
-                            (controlId: string) =>
-                              isCatalogLinkedFix(plan, controlId),
-                          ),
-                        },
-                      )
-                      live.patch({
-                        batch: {
-                          snapshot_id: s.snapshot.snapshot_id,
-                          benchmark: s.benchmark,
-                          data: b,
-                        },
-                      })
-                    },
-                  )
-                }
+                disabled={!!s.busy || selected.length < 2}
+                onClick={() => void startBatch(selected, customOrder)}
               >
                 {selected.length < 2
                   ? "Tick at least two fixes to test together"
-                  : selected.length > MAX_BATCH
-                    ? `Tick at most ${MAX_BATCH} fixes`
-                    : `Test ${selected.length} selected fixes together`}
+                  : `Test ${selected.length} selected fixes together`}
               </button>
             )}
           </section>
         </div>
+        {plan && (
+          <section className="rounded-lg border border-teal-200 bg-teal-50/40 p-4 space-y-3">
+            <h3 className="font-semibold">Test fixes for all failed checks</h3>
+            <p className="text-sm text-slate-600">
+              One click tests every setting and add-on fix above (
+              {plan.recommended_order.length}), plus any account fixes you
+              ticked, together on one throwaway copy. Fixes that need no restart
+              go first, lowest risk to highest, each checked as soon as it is
+              applied; then fixes that need a restart, with one restart. A fix
+              that fails is tested on its own to find out why, marked FAILED and
+              left out; the rest carry on. You can watch each step below.
+            </p>
+            <p className="text-xs text-slate-500">
+              Account and permission fixes are never ticked for you: each one
+              can lock out an application account. Tick the ones you want in
+              section 1 first.
+            </p>
+            {waitingForAck > 0 && (
+              <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
+                {waitingForAck} fix{waitingForAck === 1 ? "" : "es"} with a red
+                “Client action required” warning will be left out until you
+                acknowledge the warning on the fix above.
+              </p>
+            )}
+            <button
+              className={button}
+              disabled={!!s.busy || plan.recommended_order.length === 0}
+              onClick={() => {
+                const all = fixAllSelection(plan, selected, fixCleared)
+                setSelected(all)
+                setCustomOrder(false)
+                void startBatch(all, false, true)
+              }}
+            >
+              Test fixes for all failed checks
+            </button>
+          </section>
+        )}
+        <BatchProgress />
       </Card>
     </>
   )
+}
+
+// Progress of the combined test: a bar, the current step in plain words, and the
+// steps so far. Shown while the run is going and kept after it ends.
+export function BatchProgress() {
+  const s = useLive().state
+  const run =
+    s.batchRun &&
+    s.batchRun.snapshot_id === s.snapshot?.snapshot_id &&
+    s.batchRun.benchmark === s.benchmark
+      ? s.batchRun.progress
+      : null
+  if (!run) return null
+  const running = run.status === RUNNING
+  const percent = progressPercent(run)
+  const elapsed = formatDuration(run.elapsed_seconds)
+  const left = running ? formatDuration(run.estimate_seconds) : null
+  const lines = progressLines(run)
+  const bar = running
+    ? "bg-teal-600"
+    : run.status === "VERIFIED"
+      ? "bg-green-600"
+      : "bg-amber-500"
+  return (
+    <section
+      className="rounded-lg border border-slate-200 p-4 space-y-2"
+      aria-live="polite"
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        <h3 className="font-semibold flex-1">
+          {running ? "Combined test in progress" : "Combined test finished"}
+        </h3>
+        <Badge value={run.status} />
+      </div>
+      <div
+        className="h-3 w-full overflow-hidden rounded bg-slate-100"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={running ? percent : 100}
+        aria-label="Combined test progress"
+      >
+        <div
+          className={`h-full transition-all ${bar}`}
+          style={{ width: `${running ? Math.max(percent, 2) : 100}%` }}
+        />
+      </div>
+      <p className="text-sm">{stepDescription(run)}</p>
+      <p className="text-xs text-slate-500">
+        {running ? `${percent}% done` : "Done"}
+        {elapsed ? ` · ${elapsed} so far` : ""}
+        {left ? ` · about ${left} left` : ""}
+      </p>
+      {lines.length > 0 && (
+        <Fold
+          title="Steps so far"
+          count={lines.length}
+          hint="Everything the test has done, oldest first."
+        >
+          <ol className="list-decimal pl-5 text-sm space-y-1">
+            {lines.map((l, i) => (
+              <li
+                key={`${l.at}-${i}`}
+                className={
+                  l.status === "FAILED" ? "text-red-700 font-medium" : undefined
+                }
+              >
+                {l.text}
+              </li>
+            ))}
+          </ol>
+        </Fold>
+      )}
+    </section>
+  )
+}
+
+type FixGroupProps = {
+  title: string
+  items: {
+    fix_id: string
+    reason: string | null
+    stage: string | null
+  }[]
+  tone: string
+  label: (fixId: string) => string
+}
+function FixGroup({ title, items, tone, label }: FixGroupProps) {
+  if (items.length === 0) return null
+  return (
+    <div className={`rounded border px-3 py-2 text-sm space-y-1 ${tone}`}>
+      <p className="font-medium">
+        {title} ({items.length})
+      </p>
+      <ul className="list-disc pl-5">
+        {items.map((f) => (
+          <li key={f.fix_id}>
+            {label(f.fix_id)}
+            {f.reason ? `: ${f.reason}` : ""}
+            {f.stage === "combined" && f.reason
+              ? " (when tested together)"
+              : ""}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+// A fix's readable name from the result's own risk reviews; the fix id otherwise.
+function fixLabel(batch: any): (fixId: string) => string {
+  const reviews: any[] = Array.isArray(batch?.risk_reviews)
+    ? batch.risk_reviews
+    : []
+  return (fixId) => {
+    const r = reviews.find((x: any) => x?.fix_id === fixId)
+    const name = typeof r?.title === "string" && r.title ? r.title : null
+    return name ? `${name} (${fixId})` : fixId
+  }
 }
 
 // Step 5 result panel for the latest combined test (step 6 shows CombinedReview).
@@ -485,6 +675,9 @@ export function CombinedResult() {
   if (!batch) return null
   const titles = titlesBySpec(findings(s.assessment))
   const match = sameAssessment(batch, s.assessment)
+  const groups = groupFixes(batch, batch.not_eligible)
+  const label = fixLabel(batch)
+  const usable = batch.status === "VERIFIED" || batch.status === "PARTIAL"
   return (
     <section className="rounded-lg border border-slate-200 p-4 space-y-3">
       <h3 className="font-semibold">{combinedResultTitle(batch, titles)}</h3>
@@ -500,6 +693,27 @@ export function CombinedResult() {
           </span>
         )}
       </div>
+      <p className="text-sm font-medium">
+        {outcomeSentence(batch.status, groups)}
+      </p>
+      <FixGroup
+        title="Passed: in the DBA package"
+        items={groups.passed}
+        tone="border-green-200 bg-green-50 text-green-900"
+        label={label}
+      />
+      <FixGroup
+        title="FAILED: left out of the package"
+        items={groups.failed}
+        tone="border-red-200 bg-red-50 text-red-900"
+        label={label}
+      />
+      <FixGroup
+        title="Not eligible: not tested"
+        items={groups.notEligible}
+        tone="border-slate-200 bg-slate-50 text-slate-700"
+        label={label}
+      />
       {s.assessment && !match.same && (
         <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
           Before-and-after comparison not shown: {match.reason}, so comparing it
@@ -514,19 +728,17 @@ export function CombinedResult() {
           notice={
             batch.status === "VERIFIED"
               ? undefined
-              : `The combined test did not verify (${String(batch.status ?? "Not returned")}). The statuses below may not include every selected fix or what the failure broke; check the test details.`
+              : batch.status === "PARTIAL"
+                ? "Only the fixes that passed together are compared below; the fixes left out are listed above."
+                : `The combined test did not verify (${String(batch.status ?? "Not returned")}). The statuses below may not include every selected fix or what the failure broke; check the test details.`
           }
-          afterLabel={
-            batch.status === "VERIFIED"
-              ? "After combined test"
-              : "Before the failure"
-          }
+          afterLabel={usable ? "After combined test" : "Before the failure"}
         />
       )}
       <EvidenceShots evidence={batch.combined_test?.terminal_evidence} />
       <Fold
         title="Test details"
-        hint="Each fix tested alone, the combined run, the undo and clean-up, as raw evidence."
+        hint="The combined run, any fix tested on its own after a failure, the undo and clean-up, as raw evidence."
       >
         <Raw value={batch} label="Combined test, undo and clean-up evidence" />
       </Fold>
@@ -607,7 +819,7 @@ export function CombinedReview() {
   return (
     <Card
       title={`For the DBA: ${combinedResultTitle(batch, titles)}`}
-      subtitle="Each fix was tested alone, then all together. Only fixes that passed both go into the combined bundle."
+      subtitle="The fixes were tested together on one throwaway copy, each checked as it was applied and undone exactly. Only fixes that passed go into the combined bundle."
     >
       <p className="flex flex-wrap items-center gap-2">
         <Badge value={batch.status} />
@@ -709,7 +921,7 @@ export function CombinedReview() {
       <EvidenceShots evidence={batch.combined_test?.terminal_evidence} />
       <Fold
         title="Test details"
-        hint="Each fix tested alone, the combined run, the undo and clean-up, as raw evidence."
+        hint="The combined run, any fix tested on its own after a failure, the undo and clean-up, as raw evidence."
       >
         <Raw value={batch} label="Combined test, undo and clean-up evidence" />
       </Fold>

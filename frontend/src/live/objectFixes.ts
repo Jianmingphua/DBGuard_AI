@@ -326,8 +326,6 @@ export function settingFixRequest(
   }
 }
 
-export const MAX_BATCH = 6
-
 // The approved version of a fix type's template, from the fix plan's
 // `object_template_versions` ({fix_type: version|null}); null when the server could
 // not read the registry or the fix type is unknown.

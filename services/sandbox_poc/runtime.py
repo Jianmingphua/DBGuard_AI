@@ -24,6 +24,7 @@ STOCK_IMAGE = "postgres:17-bookworm"
 PINNED_IMAGES_DIR = ROOT / "catalog/images/sandbox"
 # Default sandbox image (W2B Gate 2 ruling 4): the pinned PG17 image with pgaudit,
 # switched after every live suite passed on it. Nothing is preloaded by default.
+LOG_DIR = "/var/log/postgresql"
 DEFAULT_IMAGE = json.loads((PINNED_IMAGES_DIR / "pg17-pgaudit.json").read_text())["tag"]
 
 # Reviewed postmaster-context settings the sandbox may reconstruct, change and restart
@@ -124,6 +125,10 @@ class DisposablePostgres:
                "--memory", "1g", "--cpus", "1", "--pids-limit", "128",
                "--tmpfs", f"{DATA}:rw,uid=999,gid=999,mode=0700,size=512m",
                "--tmpfs", "/var/run/postgresql:rw,uid=999,gid=999,mode=0775",
+               # The image's standard log folder, writable as on a real server, so a log_directory
+               # fix (3.1.4, approved profile value) works with the logging collector after a
+               # restart. In-memory, run-owned, removed with the container (fix of 12 Nov 2026).
+               "--tmpfs", f"{LOG_DIR}:rw,uid=999,gid=999,mode=0770,size=64m",
                "-e", "POSTGRES_USER=dbguard_poc", "-e", "POSTGRES_DB=dbguard_sandbox",
                "-e", f"POSTGRES_PASSWORD={secrets.token_hex(24)}", self.image_id, "sh", "-c",
                'trap "exit 0" TERM INT; while :; do docker-entrypoint.sh postgres & child=$!; wait "$child"; sleep 0.2; done')

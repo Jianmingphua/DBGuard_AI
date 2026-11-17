@@ -12,6 +12,8 @@ import {
   targetLabel,
 } from "./objectFixes"
 
+import { ClientImpactBox } from "./ClientImpact"
+import { cleared } from "./clientWarnings"
 // Step 5: per-object fixes for the account and permission checks (Gate 1 E).
 // Everything shown is text from the server-derived proposal or a fixed sentence;
 // choosing a fix records only its fix_id.
@@ -195,6 +197,8 @@ function ProposalCard({
   const rehearsable = p.rehearsable === true
   const level = riskLevel(p.risk)
   const source = p.limit_source ? limitSourceLabel(p.limit_source) : null
+  // E2E Gate 1 decision 3: acknowledged before it can be tested or packaged.
+  const ok = cleared(p, s.clientAcks, s.snapshot?.snapshot_id, p.fix_id)
   return (
     <article
       className={`border rounded p-3 space-y-2 ${
@@ -222,6 +226,7 @@ function ProposalCard({
       {typeof p.note === "string" && p.note && (
         <p className="text-sm text-amber-800">{p.note}</p>
       )}
+      {rehearsable && <ClientImpactBox source={p} fixId={p.fix_id} />}
       {!rehearsable ? (
         <p className="text-sm">
           <span className="font-medium">Can't rehearse: </span>
@@ -238,7 +243,7 @@ function ProposalCard({
           ) : (
             <button
               className="rounded border border-teal-700 text-teal-700 px-4 py-2 disabled:opacity-40"
-              disabled={!!s.busy || !!s.handoffId || !s.snapshot}
+              disabled={!!s.busy || !!s.handoffId || !s.snapshot || !ok}
               onClick={() =>
                 live.configure({
                   objectFix: {
@@ -260,7 +265,7 @@ function ProposalCard({
               aria-label={"Include " + p.title + " in combined test"}
               type="checkbox"
               checked={checked}
-              disabled={!!blockedBy}
+              disabled={!!blockedBy || (!ok && !checked)}
               onChange={(e) => onToggle(p.fix_id, e.target.checked)}
             />
             Add to combined test

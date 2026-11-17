@@ -34,14 +34,32 @@ def fingerprint(conn, names):
                        WHERE name = ANY(%s) ORDER BY name,sourcefile,setting""",
             (names,),
         )
-        files = [
-            dict(zip(("name", "setting", "sourcefile", "applied", "error"), r))
-            for r in cur.fetchall()
-        ]
+        # Sorted here, byte by byte, exactly as the recorded states are (provenance.signature):
+        # a server's ORDER BY follows its collation, which ignores "_" in en_US, so
+        # "logging_collector" and "log_truncate_on_rotation" came back in a different order
+        # and a correct target looked changed (found by the live package test, 16 Nov).
+        files = sorted(
+            (dict(zip(("name", "setting", "sourcefile", "applied", "error"), r))
+             for r in cur.fetchall()),
+            key=lambda r: (r["name"], r["sourcefile"], r["setting"]),
+        )
     return {"settings": settings, "file_settings": files}
 
 
-ROLE_QUERY = """SELECT rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin,
+def differing_names(current, wanted):
+    """' (differs: name, ...)' naming the settings that differ (names only, never values)."""
+    if not (isinstance(current, dict) and isinstance(wanted, dict)
+            and isinstance(current.get("settings"), dict) and isinstance(wanted.get("settings"), dict)):
+        return ""
+    a, b = current["settings"], wanted["settings"]
+    names = {n for n in set(a) | set(b) if a.get(n) != b.get(n)}
+    files = lambda fp: {(r.get("name"), str(r)) for r in fp.get("file_settings") or [] if isinstance(r, dict)}
+    names |= {n for n, _ in files(current) ^ files(wanted)}
+    names = sorted(n for n in names if isinstance(n, str) and n.replace("_", "").replace(".", "").isalnum())
+    return (" (differs: " + ", ".join(names[:12]) + ")") if names else ""
+
+
+ROLE_QUERY ="""SELECT rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin,
        rolreplication, rolbypassrls, rolconnlimit,
        CASE WHEN rolvaliduntil IS NULL THEN NULL
             WHEN NOT isfinite(rolvaliduntil) THEN rolvaliduntil::text
@@ -349,6 +367,7 @@ def execute(config, action, dsn, allow_demo=False):
             if current != wanted:
                 raise RuntimeError(
                     "Verification failed: scoped values or configuration sources differ"
+                    + differing_names(current, wanted)
                 )
             return {"action": action, "verified": True, "fix_id": config["fix_id"]}
         expected = config["prior"] if action == "apply" else config["applied"]
@@ -356,6 +375,7 @@ def execute(config, action, dsn, allow_demo=False):
         if current != expected:
             raise RuntimeError(
                 "Configuration drift detected; no SQL executed. Recollect and reassess."
+                + differing_names(current, expected)
             )
         if action in ("apply", "rollback"):
             check_setting_statements(config)
@@ -439,18 +459,14 @@ def verification_queries(config, dsn, action):
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout='10s'")
             cur.execute("SET search_path = pg_catalog, pg_temp")
+            # The server's address and port are never queried, stored or pictured (E2E gate 1,
+            # decision 2): connection details stay with the DBA.
             cur.execute(
-                "SELECT current_database(),inet_server_addr()::text,inet_server_port(),current_setting('server_version'),pg_postmaster_start_time()::text"
+                "SELECT current_database(),current_setting('server_version'),pg_postmaster_start_time()::text"
             )
             identity = dict(
                 zip(
-                    (
-                        "database",
-                        "server_address",
-                        "server_port",
-                        "server_version",
-                        "postmaster_started",
-                    ),
+                    ("database", "server_version", "postmaster_started"),
                     cur.fetchone(),
                 )
             )

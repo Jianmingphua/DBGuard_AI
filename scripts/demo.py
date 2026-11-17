@@ -173,10 +173,9 @@ class Demo:
             self.run([str(python), '-m', 'pip', 'check'], 'python-check')
             stamp.write_text(fingerprint)
         self.run([str(python), '-m', 'playwright', 'install', 'chromium'], 'evidence-browser')
-        self.env['DBGUARD_SCREENSHOTS'] = 'true'
-        # Task 2: before/after/rollback pictures of a real terminal (VHS), rendered as fallback.
-        # An explicit setting in the environment or .env.demo wins (e.g. rendered on a shared machine).
-        self.env.setdefault('DBGUARD_SCREENSHOT_MODE', 'terminal')
+        # Melvin (10 Nov): no screenshots inside the sandbox by default; they move to the DBA
+        # package later. Set DBGUARD_SCREENSHOTS=true (and DBGUARD_SCREENSHOT_MODE=terminal) in
+        # .env.demo or the environment to take them for single-fix runs again.
         self.env['DBGUARD_HISTORY_DIR'] = str(STATE/'history')
         self.run(['npm', 'ci', '--ignore-scripts'], 'npm-install', ROOT / 'frontend')
         self.run(['npm', 'run', 'typecheck'], 'ui-typecheck', ROOT / 'frontend')

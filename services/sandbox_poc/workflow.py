@@ -114,8 +114,9 @@ class RemediationLoop:
         self.alternatives = tuple(alternatives)
         self.refresh_template = refresh_template
 
-    def run(self, snapshot: dict, assessment: dict) -> dict:
-        snapshot = copy.deepcopy(snapshot)
+    def prepare(self, snapshot: dict, assessment: dict) -> dict:
+        """Every check that needs no container, and the fix unit rendered from the approved
+        template. Returns the bound inputs of a run (also used by batch.py, 12 Nov ruling)."""
         # A supplied assessment is bound to exact evidence, not merely an ID.
         actual = self.engine.bind_assessment(snapshot, assessment)
         control = self.control_id
@@ -142,6 +143,14 @@ class RemediationLoop:
         fix["rollback"] = derive_rollback(fix["prior_state"], fix["apply"])
         fix["params"]["param_value"] = fix["apply"]["value"]
         validate_contract(fix, "fix-unit-v1.json")
+        return {"actual": actual, "control": control, "name": name, "value": value, "plan": plan,
+                "fix": fix, "rendered": rendered}
+
+    def run(self, snapshot: dict, assessment: dict) -> dict:
+        snapshot = copy.deepcopy(snapshot)
+        bound = self.prepare(snapshot, assessment)
+        actual, control, name, value = bound["actual"], bound["control"], bound["name"], bound["value"]
+        plan, fix = bound["plan"], bound["fix"]
         current_template = self.template
         current_id = 'initial'
         used_sql = set()

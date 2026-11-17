@@ -35,6 +35,7 @@ from app.services.spec_engine.catalog_checks import evaluate as evaluate_catalog
 from app.services.template_service import safe_render_template
 
 from . import catalog_skeleton
+from . import client_impact
 from .handoff import OBJECT_FIX_ID_PATTERN
 from .shared import ROOT, ContractError
 
@@ -431,6 +432,8 @@ def _connection_limits(ctx: _Plan, spec: dict, outcome: dict) -> None:  # 5.5
                     f"Set connection limit {limit} on {name} (from your company policy)",
                     note=" ".join(notes) or None)
         ctx.proposals[-1]["limit_source"] = {"source": source, "profile": ctx.engine.policy_pin}
+        # E2E Gate 1 decision 3: a limit below what applications use refuses their connections.
+        ctx.proposals[-1]["client_impact"] = client_impact.connection_limit(ctx.snapshot, name, limit)
     if missing:
         ctx.note(spec, "policy_missing", None, roles=sorted(missing))
 

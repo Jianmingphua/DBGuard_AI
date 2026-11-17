@@ -10,6 +10,7 @@ from app.services.spec_engine.operators import evaluate
 from app.services.spec_engine.policy import policy_entry, site_fix
 from app.services.spec_engine.redaction import is_redacted
 from app.services.spec_engine.validate import uses_policy
+from . import client_impact
 from .provenance import setting_rows
 from .shared import ContractError
 
@@ -75,7 +76,8 @@ POLICIES = {
     ),
     "logging_collector": (
         "on",
-        "high",
+        # E2E Gate 1 decision 1 (10 Nov): restart is a downtime label, not a risk floor.
+        "medium",
         "Requires a PostgreSQL restart. In containers, logs move from the console into files; "
         "docker logs goes quiet. Files then need a writable log_directory, rotation and retention.",
         [
@@ -247,7 +249,8 @@ POLICIES = {
     # serves 3.2 and 5.6 with different risks). The risk here is the highest of them.
     "shared_preload_libraries": (
         COMPUTED,
-        "high",
+        # E2E Gate 1 decision 1: the runner refuses unless every added library loads.
+        "medium",
         "Requires a PostgreSQL restart. A library that is not installed stops the server "
         "starting; the bundle runner refuses unless every added library loads on the target.",
         ["Maintenance window", "Install the library's package on the server first"],
@@ -298,7 +301,7 @@ CATALOG_FIX_LINKS = {
         "fix_id": "fix-pgaudit",
         "settings": ("shared_preload_libraries", "pgaudit.log"),
         "library": "pgaudit",
-        "risk": "high",
+        "risk": "medium",  # E2E Gate 1 decision 1 (was high only because of the restart)
         "impact": (
             "Requires a PostgreSQL restart. pgaudit must be installed on the server first: if the "
             "library is missing PostgreSQL does not start (the bundle runner refuses unless it "
@@ -342,8 +345,11 @@ CATALOG_FIX_LINKS = {
     },
 }
 
-# Reviewed fix ordering: these fixes only take effect with the logging collector on,
-# so a failing logging_collector (3.1.3) is fixed first (see risk_review/recommend_order).
+# Reviewed fix dependencies: these fixes only take effect with the logging collector on.
+# Melvin's ruling (10 Nov): a dependency means "verify after the restart", not "apply
+# after". The log_* settings need only a reload, so they are written in phase 1; when a
+# failing logging_collector (3.1.3) is in the same batch, their check runs again after
+# the batch's one phase 2 restart has switched the collector on (batch.py).
 FIX_DEPENDENCIES = {
     name: ("logging_collector",)
     for name in ("log_truncate_on_rotation", "log_directory", "log_filename",
@@ -608,13 +614,18 @@ def risk_review(engine, snapshot, control, reviewer=None, template_risk=None):
         ),
         "reference_urls": grounding(name)[1],
     }
+    # E2E Gate 1 decision 3: fixes that can lock out clients carry an explicit warning.
+    impact = client_impact.for_setting(snapshot, name, value)
+    if impact:
+        result["client_impact"] = impact
     return review_floor_and_llm(result, name, reviewer, template_risk)
 
 
 def review_floor_and_llm(result, name, reviewer=None, template_risk=None):
-    """Raise the risk to the approved template's level and the restart floor, then add
-    the optional model advice (which may only raise the risk). Shared by setting and
-    catalog-linked fixes (catalog_fixes.catalog_risk_review)."""
+    """Raise the risk to the approved template's level, label restart downtime separately
+    (E2E Gate 1 decision 1: a restart no longer raises the risk), then add the optional
+    model advice (which may only raise the risk). Shared by setting and catalog-linked
+    fixes (catalog_fixes.catalog_risk_review)."""
     if template_risk:
         result["approved_template_risk"] = template_risk
         ranks = {"low": 0, "medium": 1, "high": 2, "not_assessed": 3}
@@ -623,8 +634,9 @@ def review_floor_and_llm(result, name, reviewer=None, template_risk=None):
             and ranks[template_risk] > ranks[result["operational_risk"]]
         ):
             result["operational_risk"] = template_risk
-    if result["requires"] == "restart":
-        result["operational_risk"] = "high"
+    # E2E Gate 1 decision 1 (10 Nov): a restart is planned downtime, shown as its own
+    # label; it no longer raises the risk, which is only what can break for users.
+    result["downtime"] = "restart" if result["requires"] == "restart" else "none"
     if reviewer:
         try:
             advice = RiskAdvice.model_validate(
@@ -692,7 +704,37 @@ def review_floor_and_llm(result, name, reviewer=None, template_risk=None):
     return result
 
 
-def recommend_order(fixes):
+RISK_RANKS = {"low": 0, "medium": 1, "high": 2, "not_assessed": 3}
+
+
+def fix_phase(fix) -> int:
+    """Batch phase (Melvin, 10 Nov): 1 = no restart (reload, none, object fixes),
+    2 = needs a PostgreSQL restart (one joint restart for all of them in a batch)."""
+    return 2 if fix.get("requires") == "restart" else 1
+
+
+def order_key(fix) -> tuple:
+    """Phase first, then lower operational risk, then fix id."""
+    return (fix_phase(fix), RISK_RANKS.get(fix.get("operational_risk"), 3), fix["fix_id"])
+
+
+def change_keys(fix) -> set:
+    """What one fix changes, for conflict checks: its settings (a catalog fix may share the
+    chainable shared_preload_libraries) or its object change (fix type and target)."""
+    if fix.get("setting") is None:
+        return {("object", json.dumps([fix.get("fix_type"), fix.get("target")], sort_keys=True))}
+    return {("setting", s) for s in (fix.get("settings") or [fix["setting"]])
+            if not (s in CHAINABLE_SETTINGS and fix.get("kind") == "catalog_setting")}
+
+
+def recommend_order(fixes, allow_missing_dependencies=False):
+    """Phase 1 (no restart) before phase 2 (restart); lower risk first within a phase.
+
+    A dependency on a fix in a later phase is not an ordering constraint: it means the
+    dependent fix is verified again after the restart (FIX_DEPENDENCIES). A dependency
+    within the same phase still orders. ``allow_missing_dependencies`` (batches only):
+    a prerequisite left out of the batch (it failed its own test) no longer blocks.
+    """
     # Keyed by fix id (Wave 2a): one control can have several per-object fixes.
     by_id = {f["fix_id"]: f for f in fixes}
     if len(by_id) != len(fixes):
@@ -715,18 +757,18 @@ def recommend_order(fixes):
         raise ContractError("Multiple fixes make the same object change")
     ordered = []
     pending = dict(by_id)
-    ranks = {"low": 0, "medium": 1, "high": 2, "not_assessed": 3}
+
+    def satisfied(fix, dep):
+        if dep in by_id:
+            # Done, or in a later phase (then verified after the restart, not applied first).
+            return dep in {x["fix_id"] for x in ordered} or fix_phase(by_id[dep]) > fix_phase(fix)
+        return allow_missing_dependencies
+
     while pending:
-        ready = [
-            f
-            for f in pending.values()
-            if all(
-                d in {x["fix_id"] for x in ordered} for d in f.get("dependencies", [])
-            )
-        ]
+        ready = [f for f in pending.values() if all(satisfied(f, d) for d in f.get("dependencies", []))]
         if not ready:
             raise ContractError("Fix dependency is missing or cyclic")
-        ready.sort(key=lambda f: (ranks.get(f["operational_risk"], 3), f["fix_id"]))
+        ready.sort(key=order_key)
         selected = ready[0]
         ordered.append(selected)
         del pending[selected["fix_id"]]

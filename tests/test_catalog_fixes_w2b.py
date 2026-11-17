@@ -439,8 +439,10 @@ class TestFixAndPlanning:
                                                    "setting": "pgaudit.log"}])
 
     @pytest.mark.parametrize("rec, policy, reviewed, operational, requires", [
-        ("3.2", True, "high", "high", "restart"),
-        ("5.6", False, "medium", "high", "restart"),   # the restart floor raises the reviewed medium
+        # E2E Gate 1 decision 1 (10 Nov): 3.2 reviewed medium, and the restart no longer
+        # raises the risk (it is shown as downtime instead).
+        ("3.2", True, "medium", "medium", "restart"),
+        ("5.6", False, "medium", "medium", "restart"),
         ("6.10", False, "medium", "medium", "reload"),
     ])
     def test_risk_levels_follow_ruling_9(self, rec, policy, reviewed, operational, requires):

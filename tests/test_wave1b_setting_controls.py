@@ -630,8 +630,9 @@ def test_fixed_risk_review_requires_restart_only_for_postmaster(engine, snapshot
     review = risk_review(engine, snap, sid(rec))
     assert (review["current_value"], review["proposed_value"]) == (bad[0], fix)
     assert review["requires"] == ("restart" if context == "postmaster" else "reload")
-    if context == "postmaster":
-        assert review["operational_risk"] == "high"
+    # E2E Gate 1 decision 1 (10 Nov): restart is a downtime label, not a risk floor.
+    assert review["downtime"] == ("restart" if context == "postmaster" else "none")
+    assert review["operational_risk"] == POLICIES[name][1]
     assert review["dba_review_required"] is True
     assert review["fix_value_source"] == {"source": "reviewed_policy"}
 

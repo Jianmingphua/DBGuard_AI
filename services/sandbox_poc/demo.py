@@ -184,6 +184,14 @@ class DemoService(SandboxService):
         self.latest = (request.model_dump(), result)
 
 
+    def prepare(self, request):
+        # No sandbox and no demo resource is touched: no lock (batch.py, 12 Nov ruling).
+        if request.snapshot != self.resources.snapshot:
+            raise HTTPException(422, "This demo only tests its own disposable source snapshot")
+        result = super().prepare(request)
+        result["demo_fixture_approval"] = True
+        return result
+
     def run(self, request):
         if not self.resources.lock.acquire(blocking=False):
             raise HTTPException(409, "A demo operation is already running. Wait for its result.")

@@ -1,6 +1,6 @@
 # DBGuardAI architecture
 
-_Last reviewed against the code: 11 Nov 2026 (`main` after PR #44)._
+_Last reviewed against the code: 11 Nov 2026 (after PR #44); the end-to-end (E2E) parts were updated on 16 Nov 2026 with the E2E work._
 For what is planned and what is done, see [docs/ROADMAP.md](docs/ROADMAP.md). For how many of the
 72 CIS rules are covered today, see [docs/COVERAGE.md](docs/COVERAGE.md) (generated, always current).
 
@@ -162,8 +162,9 @@ sequenceDiagram
   - *terminal*: `terminal_capture.py`, which records a real terminal with VHS on the host.
 
   Each mode captures before, after-fix and after-undo images. They are hashed with sha256 and stored
-  with the run. On `main` the demo turns screenshots on in terminal mode. The E2E Gate 1 ruling
-  (10 Nov) turns sandbox screenshots off by default and moves them into the DBA package (below).
+  with the run. Since the E2E work (Gate 1 ruling, 10 Nov) the demo takes no screenshots inside the
+  sandbox by default (set `DBGUARD_SCREENSHOTS=true` to turn them on); pictures are taken by the DBA
+  package on the real database (below).
 - **Review bundle** (`review_bundle.py`, `bundle_assets/`). `GET /api/v1/sandbox/runs/{id}/bundle`
   and `GET /api/v1/history/{id}/evidence-bundle` return a zip with these files:
 

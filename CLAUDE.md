@@ -74,3 +74,4 @@ The main session plans each wave and hands work out. No agent both writes someth
 | `evidence-capture-engineer` | screenshot evidence (rendered + VHS), bundle/report wiring | renders from model output |
 | `test-writer` | tests | weakens assertions |
 | `db-security-reviewer` | nothing (read-only) | edits code |
+| `architecture-reviewer` | nothing (read-only) | edits code, re-reports known gaps as new |
