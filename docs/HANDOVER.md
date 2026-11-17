@@ -51,19 +51,27 @@ Everything below is macOS, run from the repo root.
   the host, never in a container. The reason is in `docs/gates/T2-gate1.md`.
 
 ### Configure the AI model (`.env.demo`)
-Copy `.env.demo.example` to `.env.demo`. **Never commit it or paste the key anywhere.** As of 12 Nov the
-demo uses the NUS School of Computing LLM service:
+> **Disclaimer: the language model is not part of this project.** During the internship the demo used an
+> LLM service provided by Melvin's school (the NUS School of Computing), under Melvin's own account. That
+> access ends with the internship and must not be reused. **Anyone continuing this work needs their own
+> LLM provider**, with their own endpoint, model and key.
+
+Copy `.env.demo.example` to `.env.demo`. **Never commit it or paste the key anywhere.** Set your own
+provider:
 
 ```
-HERMES_MODEL=qwen3.6:35b
-HERMES_MODEL_BASE_URL=https://soclaas-api.comp.nus.edu.sg/v1
-OLLAMA_API_KEY=<your SoC LLM key>
+HERMES_MODEL=<a model from your provider that supports tool calls>
+HERMES_MODEL_BASE_URL=<your provider's OpenAI-compatible /v1 endpoint>
+OLLAMA_API_KEY=<your provider's key>
 ```
 
+- **Choosing a provider:** any OpenAI-compatible `/v1` endpoint works, as long as the model supports
+  **tool calls** (HERMES works only through its tools). The internship used `qwen3.6:35b`, and before that
+  `gpt-oss:20b` on Ollama Cloud.
 - **The key variable is still called `OLLAMA_API_KEY`.** That is historical: the demo used Ollama Cloud
-  until its credits ran out on 10 Nov. Any OpenAI-compatible `/v1` endpoint works.
+  until its credits ran out on 10 Nov.
 - **`.env.demo.example` still shows the old Ollama Cloud values** (`gpt-oss:20b`, `https://ollama.com/v1`).
-  Use the values above instead.
+  Replace them with your own provider's.
 - **The same model and URL serve three things:**
   - the HERMES agent;
   - the advisory risk reviewer (`LLMRiskReviewer` in `planning.py`);
@@ -168,7 +176,7 @@ Variants of step 4:
 
 | Part | Model and endpoint | What it can do | What it can never do |
 | --- | --- | --- | --- |
-| HERMES agent (chat in the UI and the HERMES dashboard) | `HERMES_MODEL` at `HERMES_MODEL_BASE_URL` (12 Nov: `qwen3.6:35b` on NUS SoC LLM) | Call the 11 MCP tools below | Shell, files, web, code, memory, delegation, cron: all disabled in `hermes/config/config.yaml`. No Docker socket. Never sees screenshots or raw query output (stripped in the MCP bridge) |
+| HERMES agent (chat in the UI and the HERMES dashboard) | `HERMES_MODEL` at `HERMES_MODEL_BASE_URL` (your own provider; see the disclaimer in §3) | Call the 11 MCP tools below | Shell, files, web, code, memory, delegation, cron: all disabled in `hermes/config/config.yaml`. No Docker socket. Never sees screenshots or raw query output (stripped in the MCP bridge) |
 | Risk reviewer | Same model, called by `LLMRiskReviewer` | Return risk advice in a strict schema. It can only **raise** a level | Lower a level, write SQL. Advice that contradicts known facts is discarded |
 | Adaptive retry | Same model, called by `adaptive.py` | After a failed rehearsal: pick another **already approved** candidate, or ask for human review | Supply SQL, a DSN or a new template. It never sees the raw snapshot |
 | Embeddings | Local Ollama `nomic-embed-text` | Semantic search for the older knowledge and template path | – |
